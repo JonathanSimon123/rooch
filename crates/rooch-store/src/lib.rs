@@ -10,6 +10,7 @@ use moveos_config::store_config::RocksdbConfig;
 use moveos_config::DataDirPath;
 use moveos_types::h256::H256;
 use once_cell::sync::Lazy;
+use prometheus::Registry;
 use raw_store::metrics::DBMetrics;
 use raw_store::rocks::RocksDB;
 use raw_store::{ColumnFamilyName, StoreInstance};
@@ -60,28 +61,20 @@ pub struct RoochStore {
 }
 
 impl RoochStore {
-    pub fn new(db_path: &Path) -> Result<Self> {
-        let instance = StoreInstance::new_db_instance(RocksDB::new(
-            db_path,
-            StoreMeta::get_column_family_names().to_vec(),
-            RocksdbConfig::default(),
-        )?);
-        Self::new_with_instance(instance)
-    }
-
-    pub fn new_with_metrics(db_path: &Path, db_metrics: DBMetrics) -> Result<Self> {
-        let instance = StoreInstance::new_db_instance_with_metrics(
+    pub fn new(db_path: &Path, registry: &Registry) -> Result<Self> {
+        let db_metrics = DBMetrics::get_or_init(registry).clone();
+        let instance = StoreInstance::new_db_instance(
             RocksDB::new(
                 db_path,
                 StoreMeta::get_column_family_names().to_vec(),
                 RocksdbConfig::default(),
             )?,
-            Arc::new(db_metrics),
+            db_metrics,
         );
-        Self::new_with_instance(instance)
+        Self::new_with_instance(instance, registry)
     }
 
-    pub fn new_with_instance(instance: StoreInstance) -> Result<Self> {
+    pub fn new_with_instance(instance: StoreInstance, _registry: &Registry) -> Result<Self> {
         let store = Self {
             transaction_store: TransactionDBStore::new(instance.clone()),
             meta_store: MetaDBStore::new(instance.clone()),
@@ -94,11 +87,10 @@ impl RoochStore {
 
     pub fn mock_rooch_store() -> Result<(Self, DataDirPath)> {
         let tmpdir = moveos_config::temp_dir();
-        let db_registry = prometheus::Registry::new();
-        let db_metrics = DBMetrics::new(&db_registry);
+        let registry = prometheus::Registry::new();
 
         //The testcases should hold the tmpdir to prevent the tmpdir from being deleted.
-        Ok((Self::new_with_metrics(tmpdir.path(), db_metrics)?, tmpdir))
+        Ok((Self::new(tmpdir.path(), &registry)?, tmpdir))
     }
 
     pub fn get_transaction_store(&self) -> &TransactionDBStore {
@@ -128,6 +120,10 @@ impl Debug for RoochStore {
 impl TransactionStore for RoochStore {
     fn save_transaction(&self, tx: LedgerTransaction) -> Result<()> {
         self.transaction_store.save_transaction(tx)
+    }
+
+    fn remove_transaction(&self, tx_hash: H256, tx_order: u64) -> Result<()> {
+        self.transaction_store.remove_transaction(tx_hash, tx_order)
     }
 
     fn get_transaction_by_hash(&self, hash: H256) -> Result<Option<LedgerTransaction>> {

@@ -12,9 +12,43 @@
       "name": "Apache-2.0",
       "url": "https://raw.githubusercontent.com/rooch-network/rooch/main/LICENSE"
     },
-    "version": "0.6.0"
+    "version": "0.6.6"
   },
   "methods": [
+    {
+      "name": "btc_broadcastTX",
+      "description": "Broadcast a Bitcoin transaction",
+      "params": [
+        {
+          "name": "hex",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/alloc::vec::Vec<u8>"
+          }
+        },
+        {
+          "name": "maxfeerate",
+          "schema": {
+            "type": "number",
+            "format": "double"
+          }
+        },
+        {
+          "name": "maxburnamount",
+          "schema": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      ],
+      "result": {
+        "name": "String",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
     {
       "name": "btc_queryInscriptions",
       "description": "Query the Inscription via global index by Inscription filter",
@@ -92,6 +126,25 @@
       }
     },
     {
+      "name": "rooch_dryRunRawTransaction",
+      "params": [
+        {
+          "name": "tx_bcs_hex",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/alloc::vec::Vec<u8>"
+          }
+        }
+      ],
+      "result": {
+        "name": "DryRunTransactionResponseView",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/DryRunTransactionResponseView"
+        }
+      }
+    },
+    {
       "name": "rooch_executeRawTransaction",
       "description": "Send the signed transaction in bcs hex format This method blocks waiting for the transaction to be executed.",
       "params": [
@@ -145,7 +198,7 @@
           "name": "account_addr",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/rooch_rpc_api::jsonrpc_types::address::RoochOrBitcoinAddress"
+            "$ref": "#/components/schemas/rooch_rpc_api::jsonrpc_types::address::UnitedAddress"
           }
         },
         {
@@ -172,7 +225,7 @@
           "name": "account_addr",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/rooch_rpc_api::jsonrpc_types::address::RoochOrBitcoinAddress"
+            "$ref": "#/components/schemas/rooch_rpc_api::jsonrpc_types::address::UnitedAddress"
           }
         },
         {
@@ -830,6 +883,21 @@
           }
         }
       },
+      "DryRunTransactionResponseView": {
+        "type": "object",
+        "required": [
+          "raw_output",
+          "vm_error_info"
+        ],
+        "properties": {
+          "raw_output": {
+            "$ref": "#/components/schemas/RawTransactionOutputView"
+          },
+          "vm_error_info": {
+            "$ref": "#/components/schemas/VMErrorInfo"
+          }
+        }
+      },
       "EventFilterView": {
         "oneOf": [
           {
@@ -853,7 +921,7 @@
             ],
             "properties": {
               "sender": {
-                "$ref": "#/components/schemas/rooch_rpc_api::jsonrpc_types::address::RoochOrBitcoinAddress"
+                "$ref": "#/components/schemas/rooch_rpc_api::jsonrpc_types::address::UnitedAddress"
               }
             },
             "additionalProperties": false
@@ -1018,6 +1086,16 @@
           "sequence_info"
         ],
         "properties": {
+          "error_info": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DryRunTransactionResponseView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "execution_info": {
             "$ref": "#/components/schemas/TransactionExecutionInfoView"
           },
@@ -1255,7 +1333,7 @@
             ],
             "properties": {
               "owner": {
-                "$ref": "#/components/schemas/rooch_rpc_api::jsonrpc_types::address::RoochOrBitcoinAddress"
+                "$ref": "#/components/schemas/rooch_rpc_api::jsonrpc_types::address::UnitedAddress"
               }
             },
             "additionalProperties": false
@@ -2033,15 +2111,19 @@
               "object_type_with_owner": {
                 "type": "object",
                 "required": [
+                  "filter_out",
                   "object_type",
                   "owner"
                 ],
                 "properties": {
+                  "filter_out": {
+                    "type": "boolean"
+                  },
                   "object_type": {
                     "$ref": "#/components/schemas/move_core_types::language_storage::StructTag"
                   },
                   "owner": {
-                    "$ref": "#/components/schemas/rooch_rpc_api::jsonrpc_types::address::RoochOrBitcoinAddress"
+                    "$ref": "#/components/schemas/rooch_rpc_api::jsonrpc_types::address::UnitedAddress"
                   }
                 }
               }
@@ -2069,7 +2151,7 @@
             ],
             "properties": {
               "owner": {
-                "$ref": "#/components/schemas/rooch_rpc_api::jsonrpc_types::address::RoochOrBitcoinAddress"
+                "$ref": "#/components/schemas/rooch_rpc_api::jsonrpc_types::address::UnitedAddress"
               }
             },
             "additionalProperties": false
@@ -2449,6 +2531,25 @@
           }
         }
       },
+      "RawTransactionOutputView": {
+        "type": "object",
+        "required": [
+          "gas_used",
+          "is_upgrade",
+          "status"
+        ],
+        "properties": {
+          "gas_used": {
+            "$ref": "#/components/schemas/u64"
+          },
+          "is_upgrade": {
+            "type": "boolean"
+          },
+          "status": {
+            "$ref": "#/components/schemas/KeptVMStatusView"
+          }
+        }
+      },
       "ScriptCallView": {
         "type": "object",
         "required": [
@@ -2577,7 +2678,7 @@
             ],
             "properties": {
               "sender": {
-                "$ref": "#/components/schemas/rooch_rpc_api::jsonrpc_types::address::RoochOrBitcoinAddress"
+                "$ref": "#/components/schemas/rooch_rpc_api::jsonrpc_types::address::UnitedAddress"
               }
             },
             "additionalProperties": false
@@ -2760,6 +2861,11 @@
       "TxOptions": {
         "type": "object",
         "properties": {
+          "decode": {
+            "description": "If true, the event is decoded and the decoded value is returned in the response. Only valid when with_output is true.",
+            "default": false,
+            "type": "boolean"
+          },
           "withOutput": {
             "description": "If true, the TransactionOutput is returned in the response.",
             "default": false,
@@ -2777,7 +2883,7 @@
             ],
             "properties": {
               "owner": {
-                "$ref": "#/components/schemas/rooch_rpc_api::jsonrpc_types::address::RoochOrBitcoinAddress"
+                "$ref": "#/components/schemas/rooch_rpc_api::jsonrpc_types::address::UnitedAddress"
               }
             },
             "additionalProperties": false
@@ -2916,7 +3022,13 @@
           },
           "seals": {
             "description": "Protocol seals",
-            "type": "string"
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/ObjectID"
+              }
+            }
           },
           "txid": {
             "description": "The txid of the UTXO",
@@ -2939,6 +3051,24 @@
             "type": "integer",
             "format": "uint32",
             "minimum": 0.0
+          }
+        }
+      },
+      "VMErrorInfo": {
+        "type": "object",
+        "required": [
+          "error_message",
+          "execution_state"
+        ],
+        "properties": {
+          "error_message": {
+            "type": "string"
+          },
+          "execution_state": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         }
       },
@@ -3072,7 +3202,7 @@
       "primitive_types::H256": {
         "type": "string"
       },
-      "rooch_rpc_api::jsonrpc_types::address::RoochOrBitcoinAddress": {
+      "rooch_rpc_api::jsonrpc_types::address::UnitedAddress": {
         "type": "string"
       },
       "rooch_rpc_api::jsonrpc_types::module_abi_view::MoveABIType": {

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{Ok, Result};
+use bitcoincore_rpc::bitcoin::Txid;
 use move_core_types::account_address::AccountAddress;
 use move_core_types::language_storage::{ModuleId, StructTag};
 use moveos_types::access_path::AccessPath;
@@ -13,9 +14,11 @@ use moveos_types::moveos_std::object::ObjectID;
 use moveos_types::state::{AnnotatedState, FieldKey, ObjectState};
 use moveos_types::state_resolver::{AnnotatedStateKV, StateKV};
 use moveos_types::transaction::{FunctionCall, TransactionExecutionInfo};
+use rooch_executor::actor::messages::DryRunTransactionResult;
 use rooch_executor::proxy::ExecutorProxy;
 use rooch_indexer::proxy::IndexerProxy;
 use rooch_pipeline_processor::proxy::PipelineProcessorProxy;
+use rooch_relayer::actor::bitcoin_client_proxy::BitcoinClientProxy;
 use rooch_rpc_api::jsonrpc_types::{DisplayFieldsView, IndexerObjectStateView, ObjectMetaView};
 use rooch_sequencer::proxy::SequencerProxy;
 use rooch_types::address::{BitcoinAddress, RoochAddress};
@@ -23,7 +26,9 @@ use rooch_types::framework::address_mapping::RoochToBitcoinAddressMapping;
 use rooch_types::indexer::event::{EventFilter, IndexerEvent, IndexerEventID};
 use rooch_types::indexer::state::{IndexerStateID, ObjectStateFilter};
 use rooch_types::indexer::transaction::{IndexerTransaction, TransactionFilter};
-use rooch_types::transaction::{ExecuteTransactionResponse, LedgerTransaction, RoochTransaction};
+use rooch_types::transaction::{
+    ExecuteTransactionResponse, LedgerTransaction, RoochTransaction, RoochTransactionData,
+};
 use std::collections::{BTreeMap, HashMap};
 
 /// RpcService is the implementation of the RPC service.
@@ -37,6 +42,7 @@ pub struct RpcService {
     pub(crate) sequencer: SequencerProxy,
     pub(crate) indexer: IndexerProxy,
     pub(crate) pipeline_processor: PipelineProcessorProxy,
+    pub(crate) bitcoin_client: Option<BitcoinClientProxy>,
 }
 
 impl RpcService {
@@ -47,6 +53,7 @@ impl RpcService {
         sequencer: SequencerProxy,
         indexer: IndexerProxy,
         pipeline_processor: PipelineProcessorProxy,
+        bitcoin_client: Option<BitcoinClientProxy>,
     ) -> Self {
         Self {
             chain_id,
@@ -55,6 +62,7 @@ impl RpcService {
             sequencer,
             indexer,
             pipeline_processor,
+            bitcoin_client,
         }
     }
 }
@@ -76,6 +84,11 @@ impl RpcService {
 
     pub async fn execute_tx(&self, tx: RoochTransaction) -> Result<ExecuteTransactionResponse> {
         self.pipeline_processor.execute_l2_tx(tx).await
+    }
+
+    pub async fn dry_run_tx(&self, tx: RoochTransactionData) -> Result<DryRunTransactionResult> {
+        let verified_tx = self.executor.convert_to_verified_tx(tx).await?;
+        self.executor.dry_run_transaction(verified_tx).await
     }
 
     pub async fn execute_view_function(
@@ -346,11 +359,12 @@ impl RpcService {
         rooch_addresses: Vec<RoochAddress>,
     ) -> Result<HashMap<RoochAddress, Option<BitcoinAddress>>> {
         let mapping_object_id = RoochToBitcoinAddressMapping::object_id();
-        let owner_keys = rooch_addresses
+        let user_addresses = rooch_addresses
+            .into_iter()
+            .filter(|addr| !addr.is_vm_or_system_reserved_address())
+            .collect::<Vec<_>>();
+        let owner_keys = user_addresses
             .iter()
-            .filter(|addr|
-                //skip vm and system reserved addresses
-                !addr.is_vm_or_system_reserved_address())
             .map(|addr| FieldKey::derive_from_address(&(*addr).into()))
             .collect::<Vec<_>>();
 
@@ -359,7 +373,7 @@ impl RpcService {
             .get_states(access_path)
             .await?
             .into_iter()
-            .zip(rooch_addresses)
+            .zip(user_addresses)
             .map(|(state_opt, owner)| {
                 Ok((
                     owner,
@@ -425,5 +439,21 @@ impl RpcService {
             });
         }
         Ok(display_field_views)
+    }
+
+    pub async fn broadcast_bitcoin_transaction(
+        &self,
+        hex: String,
+        maxfeerate: Option<f64>,
+        maxburnamount: Option<f64>,
+    ) -> Result<Txid> {
+        let bitcoin_client = self
+            .bitcoin_client
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Bitcoin client is not configured"))?;
+
+        bitcoin_client
+            .broadcast_transaction(hex, maxfeerate, maxburnamount)
+            .await
     }
 }

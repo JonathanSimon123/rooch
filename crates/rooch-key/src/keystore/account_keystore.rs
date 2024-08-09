@@ -69,6 +69,27 @@ pub trait AccountKeystore {
         Ok(result)
     }
 
+    fn export_mnemonic_phrase(
+        &mut self,
+        password: Option<String>,
+    ) -> Result<String, anyhow::Error> {
+        // load mnemonic phrase from keystore
+        let mnemonic = self.get_mnemonic(password.clone())?;
+        let mnemonic_phrase = mnemonic.mnemonic_phrase;
+        Ok(mnemonic_phrase)
+    }
+
+    fn import_external_account(
+        &mut self,
+        address: RoochAddress,
+        kp: RoochKeyPair,
+        password: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        let private_key_encryption = EncryptionData::encrypt_with_type(&kp, password)?;
+        self.add_address_encryption_data_to_keys(address, private_key_encryption)?;
+        Ok(())
+    }
+
     fn get_accounts(&self, password: Option<String>) -> Result<Vec<LocalAccount>, anyhow::Error>;
 
     fn add_address_encryption_data_to_keys(

@@ -23,6 +23,7 @@ use moveos_types::state::{FieldKey, ObjectState};
 use moveos_types::state_resolver::{StateKV, StatelessResolver};
 use moveos_types::transaction::{TransactionExecutionInfo, TransactionOutput};
 use once_cell::sync::Lazy;
+use prometheus::Registry;
 use raw_store::metrics::DBMetrics;
 use raw_store::rocks::RocksDB;
 use raw_store::{ColumnFamilyName, StoreInstance};
@@ -79,17 +80,9 @@ pub struct MoveOSStore {
 }
 
 impl MoveOSStore {
-    pub fn new(db_path: &Path) -> Result<Self> {
-        let instance = StoreInstance::new_db_instance(RocksDB::new(
-            db_path,
-            StoreMeta::get_column_family_names().to_vec(),
-            RocksdbConfig::default(),
-        )?);
-        Self::new_with_instance(instance)
-    }
-
-    pub fn new_with_metrics(db_path: &Path, db_metrics: Arc<DBMetrics>) -> Result<Self> {
-        let instance = StoreInstance::new_db_instance_with_metrics(
+    pub fn new(db_path: &Path, registry: &Registry) -> Result<Self> {
+        let db_metrics = DBMetrics::get_or_init(registry).clone();
+        let instance = StoreInstance::new_db_instance(
             RocksDB::new(
                 db_path,
                 StoreMeta::get_column_family_names().to_vec(),
@@ -97,12 +90,13 @@ impl MoveOSStore {
             )?,
             db_metrics,
         );
-        Self::new_with_instance(instance)
+        Self::new_with_instance(instance, registry)
     }
 
-    pub fn new_with_instance(instance: StoreInstance) -> Result<Self> {
+    pub fn new_with_instance(instance: StoreInstance, registry: &Registry) -> Result<Self> {
         let node_store = NodeDBStore::new(instance.clone());
-        let state_store = StateDBStore::new(node_store.clone());
+        let state_store = StateDBStore::new(node_store.clone(), registry);
+
         let store = Self {
             node_store,
             event_store: EventDBStore::new(instance.clone()),
@@ -115,14 +109,10 @@ impl MoveOSStore {
 
     pub fn mock_moveos_store() -> Result<(Self, DataDirPath)> {
         let tmpdir = moveos_config::temp_dir();
-        let db_registry = prometheus::Registry::new();
-        let db_metrics = DBMetrics::new(&db_registry);
+        let registry = prometheus::Registry::new();
 
         //The testcases should hold the tmpdir to prevent the tmpdir from being deleted.
-        Ok((
-            Self::new_with_metrics(tmpdir.path(), Arc::new(db_metrics))?,
-            tmpdir,
-        ))
+        Ok((Self::new(tmpdir.path(), &registry)?, tmpdir))
     }
 
     pub fn get_event_store(&self) -> &EventDBStore {

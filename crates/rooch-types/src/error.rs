@@ -50,6 +50,8 @@ pub enum RoochError {
     SignMessageError(String),
     #[error("Transaction error: {0}")]
     TransactionError(String),
+    #[error("DryRun Transaction error: {0}")]
+    DryRunTransactionError(String),
     #[error("View function error: {0}")]
     ViewFunctionError(String),
     #[error("Import account error: {0}")]
@@ -119,6 +121,18 @@ pub enum RoochError {
 
     #[error("Invalid sequencer or proposer or relayer key pair")]
     InvalidSequencerOrProposerOrRelayerKeyPair,
+
+    #[error("The local gas_config version {0} is lower than the onchain version {1}")]
+    InvalidLocalGasVersion(u64, u64),
+
+    #[error("The content length of local gas schedule is less")]
+    LessLocalGasScheduleLength,
+
+    #[error("The content of local gas schedule must be subset of onchain gas schedule")]
+    LocalIncorrectGasSchedule,
+
+    #[error("The onchain gas schedule is empty.")]
+    OnchainGasScheduleIsEmpty,
 
     #[error("VM error: {0}")]
     VMError(VMError),

@@ -222,6 +222,8 @@ export type LedgerTxDataView =
       type: 'l1_block'
     }
   | {
+      bitcoin_block_hash?: string | null
+      bitcoin_txid?: string | null
       block_hash: string
       chain_id: string
       txid: string
@@ -514,12 +516,14 @@ export interface TransactionSequenceInfoView {
   tx_timestamp: string
 }
 export interface TransactionWithInfoView {
-  execution_info: TransactionExecutionInfoView
+  execution_info?: TransactionExecutionInfoView | null
   transaction: LedgerTransactionView
 }
 export interface TxOptions {
   /** If true, the TransactionOutput is returned in the response. */
   withOutput?: boolean
+  /** If true, the event is decoded in the response. Only valid when with_output is true.*/
+  decode?: boolean
 }
 export type UTXOFilterView =
   /** Query by owner, support rooch address and bitcoin address */

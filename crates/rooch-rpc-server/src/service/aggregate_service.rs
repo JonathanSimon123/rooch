@@ -3,6 +3,7 @@
 
 use crate::service::rpc_service::RpcService;
 use anyhow::Result;
+use move_core_types::account_address::AccountAddress;
 use move_core_types::language_storage::StructTag;
 use moveos_types::access_path::AccessPath;
 use moveos_types::h256::H256;
@@ -108,7 +109,7 @@ impl AggregateService {
 
     pub async fn query_account_coin_stores(
         &self,
-        owner: RoochAddress,
+        owner: AccountAddress,
         cursor: Option<IndexerStateID>,
         limit: usize,
     ) -> Result<Vec<IndexerObjectState>> {
@@ -117,6 +118,7 @@ impl AggregateService {
             .query_object_states(
                 ObjectStateFilter::ObjectTypeWithOwner {
                     object_type: CoinStore::struct_tag_without_coin_type(),
+                    filter_out: false,
                     owner,
                 },
                 cursor,
@@ -128,7 +130,7 @@ impl AggregateService {
 
     pub async fn get_balances(
         &self,
-        owner: RoochAddress,
+        owner: AccountAddress,
         cursor: Option<IndexerStateID>,
         limit: usize,
     ) -> Result<Vec<(Option<IndexerStateID>, BalanceInfoView)>> {

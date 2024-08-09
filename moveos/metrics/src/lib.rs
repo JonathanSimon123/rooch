@@ -27,6 +27,7 @@ pub mod histogram;
 pub mod metered_channel;
 pub mod monitored_mpsc;
 pub use guards::*;
+pub mod metrics_util;
 #[cfg(test)]
 mod tests;
 
@@ -338,6 +339,13 @@ impl RegistryService {
     // Returns all the metric families from the registries that a service holds.
     pub fn gather_all(&self) -> Vec<prometheus::proto::MetricFamily> {
         self.get_all().iter().flat_map(|r| r.gather()).collect()
+    }
+}
+
+impl Default for RegistryService {
+    fn default() -> Self {
+        let default_registry = Registry::new();
+        Self::new(default_registry)
     }
 }
 

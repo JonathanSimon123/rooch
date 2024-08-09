@@ -19,12 +19,12 @@ use rooch_rpc_api::jsonrpc_types::{
     account_view::BalanceInfoView,
     event_view::{EventFilterView, EventView, IndexerEventIDView, IndexerEventView},
     transaction_view::{TransactionFilterView, TransactionWithInfoView},
-    AccessPathView, BalanceInfoPageView, EventOptions, EventPageView,
-    ExecuteTransactionResponseView, FunctionCallView, H256View, IndexerEventPageView,
-    IndexerObjectStatePageView, IndexerStateIDView, ModuleABIView, ObjectIDVecView,
-    ObjectStateFilterView, ObjectStateView, QueryOptions, RoochAddressView,
-    RoochOrBitcoinAddressView, StateKVView, StateOptions, StatePageView, StrView, StructTagView,
-    TransactionWithInfoPageView, TxOptions,
+    AccessPathView, BalanceInfoPageView, DryRunTransactionResponseView, EventOptions,
+    EventPageView, ExecuteTransactionResponseView, FunctionCallView, H256View,
+    IndexerEventPageView, IndexerObjectStatePageView, IndexerStateIDView, ModuleABIView,
+    ObjectIDVecView, ObjectStateFilterView, ObjectStateView, QueryOptions,
+    RawTransactionOutputView, RoochAddressView, StateKVView, StateOptions, StatePageView, StrView,
+    StructTagView, TransactionWithInfoPageView, TxOptions, UnitedAddressView,
 };
 use rooch_rpc_api::{
     api::rooch_api::RoochAPIServer,
@@ -36,10 +36,10 @@ use rooch_rpc_api::{
     RpcError, RpcResult,
 };
 use rooch_types::indexer::state::IndexerStateID;
-use rooch_types::transaction::{RoochTransaction, TransactionWithInfo};
+use rooch_types::transaction::{RoochTransaction, RoochTransactionData, TransactionWithInfo};
 use std::cmp::min;
 use std::str::FromStr;
-use tracing::info;
+use tracing::{debug, info};
 
 pub struct RoochServer {
     rpc_service: RpcService,
@@ -96,9 +96,13 @@ impl RoochAPIServer for RoochServer {
     }
 
     async fn send_raw_transaction(&self, payload: BytesView) -> RpcResult<H256View> {
-        info!("send_raw_transaction payload: {:?}", payload);
+        debug!("send_raw_transaction payload: {:?}", payload);
         let mut tx = bcs::from_bytes::<RoochTransaction>(&payload.0)?;
-        info!("send_raw_transaction tx: {:?}", tx);
+        info!(
+            "send_raw_transaction tx sender:{:?}, hash:{}",
+            tx.sender(),
+            tx.tx_hash()
+        );
 
         let hash = tx.tx_hash();
         self.rpc_service.queue_tx(tx).await?;
@@ -115,11 +119,62 @@ impl RoochAPIServer for RoochServer {
         let tx_response = self.rpc_service.execute_tx(tx).await?;
 
         let result = if tx_options.with_output {
-            ExecuteTransactionResponseView::from(tx_response)
+            let mut txn_resp_view = ExecuteTransactionResponseView::from(tx_response.clone());
+            if tx_options.decode {
+                let event_ids = tx_response
+                    .output
+                    .events
+                    .iter()
+                    .map(|e| e.event_id.clone())
+                    .collect();
+                let annotated_events = self.rpc_service.get_events_by_event_ids(event_ids).await?;
+                let event_views = annotated_events
+                    .into_iter()
+                    .map(|event| event.map(EventView::from))
+                    .collect::<Vec<Option<_>>>();
+                debug_assert!(
+                    txn_resp_view.output.is_some()
+                        && event_views.len() == txn_resp_view.output.as_ref().unwrap().events.len(),
+                    "event_views length should be equal to txn_resp_view.output.events length"
+                );
+                let output_view = txn_resp_view.output.clone().map(|mut output| {
+                    output.events.iter_mut().zip(event_views).for_each(
+                        |(event, event_view_opt)| {
+                            if let Some(decoded_event_view) = event_view_opt {
+                                event.decoded_event_data = decoded_event_view.decoded_event_data;
+                            }
+                        },
+                    );
+                    output
+                });
+                txn_resp_view.output = output_view;
+                txn_resp_view
+            } else {
+                txn_resp_view
+            }
         } else {
             ExecuteTransactionResponseView::new_without_output(tx_response)
         };
         Ok(result)
+    }
+
+    async fn dry_run(&self, payload: BytesView) -> RpcResult<DryRunTransactionResponseView> {
+        let tx = bcs::from_bytes::<RoochTransactionData>(&payload.0)?;
+        let tx_result = self.rpc_service.dry_run_tx(tx).await?;
+        let raw_output = tx_result.raw_output;
+
+        let raw_output_view = RawTransactionOutputView {
+            status: raw_output.status.into(),
+            gas_used: raw_output.gas_used.into(),
+            is_upgrade: raw_output.is_upgrade,
+        };
+
+        let tx_response = DryRunTransactionResponseView {
+            raw_output: raw_output_view,
+            vm_error_info: tx_result.vm_error_info.unwrap_or_default(),
+        };
+
+        Ok(tx_response)
     }
 
     async fn execute_view_function(
@@ -504,7 +559,7 @@ impl RoochAPIServer for RoochServer {
 
     async fn get_balance(
         &self,
-        account_addr: RoochOrBitcoinAddressView,
+        account_addr: UnitedAddressView,
         coin_type: StructTagView,
     ) -> RpcResult<BalanceInfoView> {
         Ok(self
@@ -517,7 +572,7 @@ impl RoochAPIServer for RoochServer {
     /// get account balances by RoochAddress
     async fn get_balances(
         &self,
-        account_addr: RoochOrBitcoinAddressView,
+        account_addr: UnitedAddressView,
         cursor: Option<IndexerStateIDView>,
         limit: Option<StrView<u64>>,
     ) -> RpcResult<BalanceInfoPageView> {

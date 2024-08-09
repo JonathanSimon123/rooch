@@ -1,12 +1,22 @@
 // Copyright (c) RoochNetwork
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::cli_types::WalletContextOptions;
-use crate::commands::statedb::commands::export::ExportID;
-use crate::commands::statedb::commands::{GLOBAL_STATE_TYPE_PREFIX, GLOBAL_STATE_TYPE_ROOT};
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read};
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::{mpsc, Arc, RwLock};
+use std::thread;
+use std::time::{Instant, SystemTime};
+
 use anyhow::{Error, Result};
 use chrono::{DateTime, Local};
 use clap::Parser;
+use serde::{Deserialize, Serialize};
+
+use metrics::RegistryService;
 use moveos_store::MoveOSStore;
 use moveos_types::h256::H256;
 use moveos_types::moveos_std::object::{ObjectID, ObjectMeta, GENESIS_STATE_ROOT};
@@ -18,19 +28,13 @@ use rooch_db::RoochDB;
 use rooch_genesis::RoochGenesis;
 use rooch_types::error::{RoochError, RoochResult};
 use rooch_types::rooch_network::RoochChainID;
-use serde::{Deserialize, Serialize};
 use smt::{TreeChangeSet, UpdateSet};
-use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
-use std::path::PathBuf;
-use std::str::FromStr;
-use std::sync::mpsc::{Receiver, SyncSender};
-use std::sync::{mpsc, Arc};
-use std::thread;
-use std::time::SystemTime;
 
-/// Import statedb
+use crate::cli_types::WalletContextOptions;
+use crate::commands::statedb::commands::export::ExportID;
+use crate::commands::statedb::commands::{GLOBAL_STATE_TYPE_PREFIX, GLOBAL_STATE_TYPE_ROOT};
+
+/// Import state data exported by export command.
 #[derive(Debug, Parser)]
 pub struct ImportCommand {
     #[clap(long, short = 'i')]
@@ -89,7 +93,9 @@ impl ImportCommand {
         let datetime: DateTime<Local> = start_time.into();
 
         let opt = RoochOpt::new_with_default(self.base_data_dir, self.chain_id, None).unwrap();
-        let rooch_db = RoochDB::init(opt.store_config()).unwrap();
+        let registry_service = RegistryService::default();
+        let rooch_db =
+            RoochDB::init(opt.store_config(), &registry_service.default_registry()).unwrap();
         let genesis = RoochGenesis::load_or_init(opt.network(), &rooch_db).unwrap();
         let root = genesis.genesis_root().clone();
         println!(
@@ -143,7 +149,7 @@ fn produce_updates(
                 if line.starts_with(GLOBAL_STATE_TYPE_ROOT) {
                     break;
                 }
-                let (_c1, c2) = parse_state_data_from_csv_line(&line)?;
+                let (_c1, c2) = parse_csv_fields(&line)?;
                 let export_id = ExportID::from_str(&c2)?;
                 // let eventual_state_root = export_id.parent_state_root;
                 // // TODO add cache to avoid duplicate read smt
@@ -156,7 +162,7 @@ fn produce_updates(
                 continue;
             }
 
-            let (c1, c2) = parse_state_data_from_csv_line(&line)?;
+            let (c1, c2) = parse_csv_fields(&line)?;
             let key_state = FieldKey::from_str(&c1)?;
             let state = ObjectState::from_str(&c2)?;
             let state_id = last_state_id.clone().expect("State ID should have value");
@@ -174,7 +180,7 @@ fn produce_updates(
 }
 
 // csv format: c1,c2
-pub fn parse_state_data_from_csv_line(line: &str) -> Result<(String, String)> {
+pub fn parse_csv_fields(line: &str) -> Result<(String, String)> {
     let str_list: Vec<&str> = line.trim().split(',').collect();
     if str_list.len() != 2 {
         return Err(Error::from(RoochError::from(Error::msg(format!(
@@ -290,4 +296,36 @@ where
 pub fn apply_nodes(moveos_store: &MoveOSStore, nodes: BTreeMap<H256, Vec<u8>>) -> Result<()> {
     moveos_store.state_store.node_store.write_nodes(nodes)?;
     Ok(())
+}
+
+// finish import job with new startup update set
+pub fn finish_import_job(
+    moveos_store: Arc<MoveOSStore>,
+    root_size: u64,
+    pre_root_state_root: H256,
+    task_start_time: Instant,
+    new_startup_update_set: Option<Arc<RwLock<UpdateSet<FieldKey, ObjectState>>>>,
+) {
+    let root_state_root = match new_startup_update_set {
+        Some(new_startup_update_set) => {
+            let new_startup_update_set = new_startup_update_set.read().unwrap();
+            let new_startup_update_set = new_startup_update_set.clone();
+            let tree_change_set =
+                apply_fields(&moveos_store, pre_root_state_root, new_startup_update_set).unwrap();
+            apply_nodes(&moveos_store, tree_change_set.nodes).unwrap();
+            tree_change_set.state_root
+        }
+        None => pre_root_state_root,
+    };
+    // Update Startup Info
+    let new_startup_info = StartupInfo::new(root_state_root, root_size);
+    moveos_store
+        .get_config_store()
+        .save_startup_info(new_startup_info.clone())
+        .unwrap();
+    println!(
+        "Done in {:?}. New startup_info: {:?}",
+        task_start_time.elapsed(),
+        new_startup_info
+    );
 }

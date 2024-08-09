@@ -4,7 +4,13 @@
 import { Args } from '../bcs/index.js'
 import { Signer } from '../crypto/index.js'
 import { CreateSessionArgs, Session } from '../session/index.js'
-import { isValidRoochAddress, decodeToRoochAddressStr } from '../address/index.js'
+import {
+  isValidRoochAddress,
+  decodeToRoochAddressStr,
+  Address,
+  BitcoinAddress,
+  BitcoinNetowkType,
+} from '../address/index.js'
 import { address, Bytes, u64 } from '../types/index.js'
 import { fromHEX, str } from '../utils/index.js'
 import { RoochHTTPTransport, RoochTransport } from './httpTransport.js'
@@ -42,6 +48,8 @@ import {
   GetEventsByEventHandleParams,
   QueryEventsParams,
   PaginatedIndexerEventViews,
+  ModuleABIView,
+  GetModuleABIParams,
 } from './types/index.js'
 
 /**
@@ -85,6 +93,15 @@ export class RoochClient {
    */
   constructor(options: RoochClientOptions) {
     this.transport = options.transport ?? new RoochHTTPTransport({ url: options.url })
+  }
+
+  async getRpcApiVersion(): Promise<string | undefined> {
+    const resp = await this.transport.request<{ info: { version: string } }>({
+      method: 'rpc.discover',
+      params: [],
+    })
+
+    return resp.info.version
   }
 
   async getChainId(): Promise<u64> {
@@ -165,6 +182,12 @@ export class RoochClient {
     })
   }
 
+  async getModuleAbi(params: GetModuleABIParams): Promise<ModuleABIView> {
+    return await this.transport.request({
+      method: 'rooch_getModuleABI',
+      params: [params.moduleAddr, params.moduleName],
+    })
+  }
   async getEvents(input: GetEventsByEventHandleParams): Promise<PaginatedEventViews> {
     return await this.transport.request({
       method: 'rooch_getEventsByEventHandle',
@@ -292,6 +315,23 @@ export class RoochClient {
       transaction: tx,
       signer: input.signer,
     })
+  }
+
+  async resolveBTCAddress(input: { roochAddress: string | Address; network: BitcoinNetowkType }): Promise<BitcoinAddress | undefined> {
+    const result = await this.executeViewFunction({
+      target: '0x3::address_mapping::resolve_bitcoin',
+      args: [Args.address(input.roochAddress)],
+    })
+
+    if (result.vm_status === 'Executed' && result.return_values) {
+      const value = (result.return_values[0].decoded_value as AnnotatedMoveStructView).value
+
+      const address = (((value as any).vec[0] as AnnotatedMoveStructView).value as any).bytes
+
+      return new BitcoinAddress(address, input.network)
+    }
+
+    return undefined
   }
 
   async createSession({ sessionArgs, signer }: { sessionArgs: CreateSessionArgs; signer: Signer }) {

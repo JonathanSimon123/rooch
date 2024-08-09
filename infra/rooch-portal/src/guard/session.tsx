@@ -11,6 +11,7 @@ import {
 import { SessionKeyModal } from '@/components/session-key-modal.tsx'
 import { navItems } from '@/navigation'
 import { useNetworkVariable } from '@/networks'
+import { ErrorValidateCantPayGasDeposit } from '@roochnetwork/rooch-sdk'
 
 interface SessionGuardProps {
   children: ReactNode
@@ -45,25 +46,37 @@ export const SessionGuard = (props: SessionGuardProps) => {
     )
   }, [isConnected, location, sessionKey])
 
+  const allScope = defaultScope.concat(mintAddress.map((address) => `${address}::*::*`))
+
   const handleAuth = async () => {
     setError(null)
     try {
       await createSessionKey({
         appName: 'rooch-portal',
         appUrl: 'portal.rooch.network',
-        scopes: defaultScope.concat(mintAddress.map((address) => `${address}::*::*`)),
+        scopes: allScope,
+        maxInactiveInterval: 60 * 60 * 8,
       })
-    } catch (e) {
-      console.log(e)
-      setError(
-        'Authorization failed due to insufficient gas fees. Please ensure you have enough gas fees.',
-      )
+    } catch (e: any) {
+      let msg = ''
+      if ('message' in e) {
+        msg = e.message
+      }
+      if ('code' in e) {
+        switch (e.code) {
+          case ErrorValidateCantPayGasDeposit:
+            msg =
+              'Authorization failed due to insufficient gas fees. Please ensure you have enough gas fees.'
+            break
+        }
+      }
+      setError(msg)
     }
   }
 
   return (
     <>
-      <SessionKeyModal isOpen={open} onAuthorize={handleAuth} scopes={defaultScope} error={error} />
+      <SessionKeyModal isOpen={open} onAuthorize={handleAuth} scopes={allScope} error={error} />
       {children}
     </>
   )

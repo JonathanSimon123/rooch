@@ -1,10 +1,10 @@
 // Copyright (c) RoochNetwork
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::address::RoochAddress;
 use crate::bitcoin::utxo::UTXO;
 use crate::indexer::Filter;
 use anyhow::Result;
+use move_core_types::account_address::AccountAddress;
 use move_core_types::effects::Op;
 use move_core_types::language_storage::StructTag;
 use moveos_types::moveos_std::object::{ObjectID, ObjectMeta};
@@ -134,12 +134,13 @@ pub enum ObjectStateFilter {
     /// Query by object type and owner.
     ObjectTypeWithOwner {
         object_type: StructTag,
-        owner: RoochAddress,
+        filter_out: bool,
+        owner: AccountAddress,
     },
     /// Query by object type.
     ObjectType(StructTag),
     /// Query by owner.
-    Owner(RoochAddress),
+    Owner(AccountAddress),
     /// Query by object ids.
     ObjectId(Vec<ObjectID>),
 }
@@ -147,9 +148,9 @@ pub enum ObjectStateFilter {
 impl ObjectStateFilter {
     fn try_matches(&self, item: &IndexerObjectState) -> Result<bool> {
         Ok(match self {
-            ObjectStateFilter::ObjectTypeWithOwner { object_type, owner } => {
-                object_type == item.object_struct_tag() && owner == &item.metadata.owner
-            }
+            ObjectStateFilter::ObjectTypeWithOwner {
+                object_type, owner, ..
+            } => object_type == item.object_struct_tag() && owner == &item.metadata.owner,
             ObjectStateFilter::ObjectType(object_type) => object_type == item.object_struct_tag(),
             ObjectStateFilter::Owner(owner) => owner == &item.metadata.owner,
             ObjectStateFilter::ObjectId(object_ids) => {
