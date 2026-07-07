@@ -1,0 +1,44 @@
+{
+  "name": "@roochnetwork/rooch-pruner-e2e",
+  "author": "Rooch.network <opensource@rooch.network>",
+  "version": "0.1.0",
+  "description": "Rooch Pruner End-to-End Tests",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "packageManager": "pnpm@9.1.0",
+  "scripts": {
+    "clean": "rimraf tsconfig.tsbuildinfo rimraf dist",
+    "vitest": "vitest",
+    "test": "vitest run src",
+    "test:gc": "vitest run src/case/gc-recycle.spec.ts",
+    "test:gc:dry-run": "vitest run src/case/gc-recycle.spec.ts --reporter=verbose -t \"GC Dry Run\"",
+    "test:gc:execute": "vitest run src/case/gc-recycle.spec.ts --reporter=verbose -t \"GC Execution\"",
+    "test:gc:stress": "GC_STRESS_MODE=true GC_STRESS_DURATION=3600 GC_STRESS_TPS=10 vitest run src/case/gc-recycle.spec.ts",
+    "test:gc:stress:quick": "GC_STRESS_MODE=true GC_STRESS_DURATION=300 GC_STRESS_TPS=5 GC_STRESS_REPORT_INTERVAL=30 vitest run src/case/gc-recycle.spec.ts",
+    "test:gc:stress:custom": "GC_STRESS_MODE=true vitest run src/case/gc-recycle.spec.ts",
+    "eslint:check": "eslint --max-warnings=0 .",
+    "eslint:fix": "pnpm eslint:check --fix",
+    "prettier:check": "prettier -c --ignore-unknown .",
+    "prettier:fix": "prettier -w --ignore-unknown .",
+    "lint": "pnpm eslint:check && pnpm prettier:check",
+    "lint:fix": "pnpm eslint:fix && pnpm prettier:fix"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rooch-network/rooch.git"
+  },
+  "homepage": "https://github.com/rooch-network/rooch",
+  "bugs": {
+    "url": "https://github.com/rooch-network/rooch/issues"
+  },
+  "type": "module",
+  "devDependencies": {
+    "@roochnetwork/test-suite": "workspace:*",
+    "@types/node": "^20.14.10",
+    "typescript": "^5.3.3",
+    "vite": "^5.4.21",
+    "vitest": "^1.6.0"
+  }
+}

@@ -4,14 +4,17 @@
 module rooch_framework::address_mapping{
     
     use std::option::{Self, Option};
+    use std::vector;
     use moveos_std::core_addresses;
     use moveos_std::object::{Self, Object};
+    use rooch_framework::onchain_config;
     use rooch_framework::multichain_address::{Self, MultiChainAddress};
     use rooch_framework::bitcoin_address::{Self, BitcoinAddress};
 
     friend rooch_framework::genesis;
     friend rooch_framework::bitcoin_validator;
     friend rooch_framework::transaction_validator;
+    friend rooch_framework::transfer;
     
     const ErrorMultiChainAddressInvalid: u64 = 1;
     const ErrorUnsupportedAddress: u64 = 2;
@@ -33,14 +36,20 @@ module rooch_framework::address_mapping{
     }
 
     public(friend) fun genesis_init(_genesis_account: &signer) {
-        let multichain_mapping = object::new_named_object(MultiChainAddressMapping{
-            _placeholder: false
-        });
-        let rooch_to_bitcoin_mapping = object::new_named_object(RoochToBitcoinAddressMapping{
-            _placeholder: false
-        });
-        object::transfer_extend(multichain_mapping, @rooch_framework);
-        object::transfer_extend(rooch_to_bitcoin_mapping, @rooch_framework);
+        let multichain_mapping_id = object::named_object_id<MultiChainAddressMapping>();
+        if(!object::exists_object(multichain_mapping_id)){
+            let multichain_mapping = object::new_named_object(MultiChainAddressMapping{
+                _placeholder: false
+            });
+            object::transfer_extend(multichain_mapping, @rooch_framework);
+        };
+        let rooch_to_bitcoin_mapping_id = object::named_object_id<RoochToBitcoinAddressMapping>();
+        if(!object::exists_object(rooch_to_bitcoin_mapping_id)){
+            let rooch_to_bitcoin_mapping = object::new_named_object(RoochToBitcoinAddressMapping{
+                _placeholder: false
+            });
+            object::transfer_extend(rooch_to_bitcoin_mapping, @rooch_framework);
+        };
     }
 
     fun borrow_multichain() : &Object<MultiChainAddressMapping> {
@@ -107,17 +116,18 @@ module rooch_framework::address_mapping{
         Self::resolve_bitcoin_address(am, rooch_address)
     }
 
-    /// Generate a rooch address via bitcoin multi-chain address
-    /// This function will deprecated in the future, client should directly generate rooch address via bitcoin address.
-    public fun resolve_or_generate(maddress: MultiChainAddress): address {
-        if (multichain_address::is_rooch_address(&maddress)) {
-            return multichain_address::into_rooch_address(maddress)
-        };
-        if (multichain_address::is_bitcoin_address(&maddress)) {
-            return bitcoin_address::to_rooch_address(&multichain_address::into_bitcoin_address(maddress))
-        };
-        abort ErrorUnsupportedAddress
-    }
+    /// Resolve a batch rooch addresses to bitcoin addresses
+    public fun resolve_bitcoin_batch(rooch_addresses: vector<address>): vector<BitcoinAddress> {
+        let am = Self::borrow_rooch_to_bitcoin();
+        vector::map(rooch_addresses, |rooch_address| {
+            let addr_opt = Self::resolve_bitcoin_address(am, rooch_address);
+            if(option::is_none(&addr_opt)){
+                bitcoin_address::empty()
+            }else{
+                option::destroy_some(addr_opt)
+            }
+        })
+    } 
 
     /// Check if a multi-chain address is bound to a rooch address
     public fun exists_mapping(maddress: MultiChainAddress): bool {
@@ -125,17 +135,73 @@ module rooch_framework::address_mapping{
         Self::exists_mapping_address(obj, maddress)
     }
 
-    public(friend) fun bind_bitcoin_address(rooch_address: address, baddress: BitcoinAddress) {
+    public(friend) fun bind_bitcoin_address_internal(rooch_address: address, btc_address: BitcoinAddress) {
         // bitcoin address to rooch address do not need to record, we just record rooch address to bitcoin address
         let obj = Self::borrow_rooch_to_bitcoin_mut();
         if(!object::contains_field(obj, rooch_address)){
-            object::add_field(obj, rooch_address, baddress);
+            object::add_field(obj, rooch_address, btc_address);
         }
     }
 
-    public fun bind_bitcoin_address_by_system(system: &signer, rooch_address: address, baddress: BitcoinAddress) {
+    public fun bind_bitcoin_address_by_system(system: &signer, rooch_address: address, btc_address: BitcoinAddress) {
         core_addresses::assert_system_reserved(system);
-        Self::bind_bitcoin_address(rooch_address, baddress);
+        Self::bind_bitcoin_address_internal(rooch_address, btc_address);
+    }
+
+
+    /// Bind a bitcoin address to a rooch address
+    /// We can calculate the rooch address from bitcoin address
+    /// So we call this function for record rooch address to bitcoin address mapping
+    public fun bind_bitcoin_address(btc_address: BitcoinAddress){
+        let rooch_addr = bitcoin_address::to_rooch_address(&btc_address);
+        Self::bind_bitcoin_address_internal(rooch_addr, btc_address);
+    }
+
+    public entry fun reset_rooch_to_bitcoin_mapping(account: &signer) {
+        onchain_config::ensure_admin(account);
+        reset_rooch_to_bitcoin_mapping_internal();
+    }
+
+    fun reset_rooch_to_bitcoin_mapping_internal() {
+        let object_id = object::named_object_id<RoochToBitcoinAddressMapping>();
+        if (object::exists_object_with_type<RoochToBitcoinAddressMapping>(object_id)) {
+            let system = moveos_std::signer::module_signer<RoochToBitcoinAddressMapping>();
+            let obj = borrow_rooch_to_bitcoin_mut();
+            object::clear_fields_by_system(&system, obj);
+        }
+    }
+
+    #[test_only]
+    use std::string;
+
+    #[test]
+    fun test_address_mapping_for_bitcoin(){
+        let genesis_account = moveos_std::signer::module_signer<RoochToBitcoinAddressMapping>();
+        genesis_init(&genesis_account);
+        let btc_addr = bitcoin_address::from_string(&string::utf8(b"bc1p8xpjpkc9uzj2dexcxjg9sw8lxje85xa4070zpcys589e3rf6k20qm6gjrt"));
+        bind_bitcoin_address(btc_addr);
+        let rooch_addr = bitcoin_address::to_rooch_address(&btc_addr);
+        let resolved_addr = resolve_bitcoin(rooch_addr);
+        assert!(resolved_addr == option::some(btc_addr), 1);
+    }
+
+    #[test]
+    fun test_address_mapping_for_bitcoin_batch(){
+        let genesis_account = moveos_std::signer::module_signer<RoochToBitcoinAddressMapping>();
+        genesis_init(&genesis_account);
+        let btc_addr = bitcoin_address::from_string(&string::utf8(b"bc1p8xpjpkc9uzj2dexcxjg9sw8lxje85xa4070zpcys589e3rf6k20qm6gjrt"));
+        bind_bitcoin_address(btc_addr);
+        let rooch_addr = bitcoin_address::to_rooch_address(&btc_addr);
+        let addresses = vector[rooch_addr, @0x42];
+        let resolved_addrs = resolve_bitcoin_batch(addresses);
+        assert!(vector::length(&resolved_addrs) == 2, 1);
+        assert!(*vector::borrow(&resolved_addrs, 0) == btc_addr, 1);
+        assert!(bitcoin_address::is_empty(vector::borrow(&resolved_addrs, 1)), 1);
+    }
+
+    #[test_only]
+    public fun rooch_to_bitcoin_field_size_for_test(): u64 {
+        object::field_size(borrow_rooch_to_bitcoin())
     }
 
 }

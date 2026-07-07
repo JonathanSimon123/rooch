@@ -25,6 +25,7 @@ module moveos_std::tx_context {
     friend moveos_std::module_store;
 
     const ErrorInvalidContext: u64 = 1;
+    const ErrorRepeatedContextKey: u64 = 2;
  
     /// Information about the transaction currently being executed.
     struct TxContext {
@@ -68,7 +69,7 @@ module moveos_std::tx_context {
     } 
 
     /// Generate a new unique address,
-    public(friend) fun fresh_address(): address {
+    public fun fresh_address(): address {
         let ctx = borrow_mut();
         let addr = derive_id(ctx.tx_hash, ctx.ids_created);
         ctx.ids_created = ctx.ids_created + 1;
@@ -97,6 +98,7 @@ module moveos_std::tx_context {
     fun add<T: drop + store + copy>(self: &mut TxContext, value: T) {
         let any = copyable_any::pack(value);
         let type_name = *copyable_any::type_name(&any);
+        assert!(!simple_map::contains_key(&self.map, &type_name), ErrorRepeatedContextKey);
         simple_map::add(&mut self.map, type_name, any)
     }
 
@@ -136,8 +138,14 @@ module moveos_std::tx_context {
         contains<T>(ctx)
     }
 
+    /// Remove a value from the context map
+    fun remove<T: drop + store + copy>(self: &mut TxContext) {
+        let type_name = type_info::type_name<T>();
+        simple_map::remove(&mut self.map, &type_name);
+    }
+
     /// Get the transaction meta data
-    /// The TxMeta is writed by the VM before the transaction execution.
+    /// The TxMeta is written by the VM before the transaction execution.
     /// The meta data is only available when executing or validating a transaction, otherwise abort(eg. readonly function call).
     public fun tx_meta(): TxMeta {
         let ctx = borrow();
@@ -193,9 +201,8 @@ module moveos_std::tx_context {
             tx_hash: _,
             tx_size: _,
             ids_created: _,
-            map,
+            map:_,
         } = self;
-        simple_map::drop(map);
     }
 
     fun borrow(): &TxContext {
@@ -222,6 +229,26 @@ module moveos_std::tx_context {
     public fun set_ctx_sequencer_number_for_testing(sequence_number: u64){
         let ctx = borrow_mut();
         ctx.sequence_number = sequence_number;
+    }
+
+    #[test_only]
+    /// set the TxContext tx_hash for unit test
+    public fun set_ctx_tx_hash_for_testing(tx_hash: vector<u8>){
+        let ctx = borrow_mut();
+        ctx.tx_hash = tx_hash;
+    }
+
+    #[test_only]
+    /// Set an attribute value in the context map for testing
+    public fun set_attribute_for_testing<T: drop + store + copy>(value: T) {
+        let ctx = borrow_mut();
+        add(ctx, value);
+    }
+
+    #[test_only]
+    public fun remove_attribute_for_testing<T: drop + store + copy>() {
+        let ctx = borrow_mut();
+        remove<T>(ctx);
     }
 
     #[test_only]

@@ -3,15 +3,17 @@
 
 use crate::service::rpc_service::RpcService;
 use anyhow::Result;
+use bitcoincore_rpc::bitcoin::Txid;
 use jsonrpsee::{core::async_trait, RpcModule};
 use rooch_rpc_api::api::btc_api::BtcAPIServer;
 use rooch_rpc_api::api::{RoochRpcModule, DEFAULT_RESULT_LIMIT_USIZE, MAX_RESULT_LIMIT_USIZE};
 use rooch_rpc_api::jsonrpc_types::btc::ord::{InscriptionFilterView, InscriptionStateView};
 use rooch_rpc_api::jsonrpc_types::btc::utxo::{UTXOFilterView, UTXOStateView};
 use rooch_rpc_api::jsonrpc_types::{
-    IndexerStateIDView, InscriptionPageView, StrView, UTXOPageView,
+    BytesView, IndexerStateIDView, InscriptionPageView, StrView, UTXOPageView,
 };
 use rooch_rpc_api::RpcResult;
+use rooch_types::indexer::state::ObjectStateType;
 use std::cmp::min;
 
 pub struct BtcServer {
@@ -50,6 +52,7 @@ impl BtcAPIServer for BtcServer {
                 descending_order,
                 false,
                 false,
+                ObjectStateType::UTXO,
             )
             .await?;
 
@@ -93,6 +96,7 @@ impl BtcAPIServer for BtcServer {
                 descending_order,
                 false,
                 false,
+                ObjectStateType::Inscription,
             )
             .await?;
 
@@ -110,6 +114,21 @@ impl BtcAPIServer for BtcServer {
             next_cursor,
             has_next_page,
         })
+    }
+
+    async fn broadcast_tx(
+        &self,
+        hex: BytesView,
+        maxfeerate: Option<f64>,
+        maxburnamount: Option<f64>,
+    ) -> RpcResult<String> {
+        let tx_hex = hex::encode(hex.0);
+        let txid: Txid = self
+            .rpc_service
+            .broadcast_bitcoin_transaction(tx_hex, maxfeerate, maxburnamount)
+            .await?;
+
+        Ok(txid.to_string())
     }
 }
 

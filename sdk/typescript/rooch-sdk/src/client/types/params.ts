@@ -11,6 +11,13 @@
  */
 
 import type * as RpcTypes from './generated.js'
+import type { address } from '../../types/index.js'
+/** Broadcast a Bitcoin transaction */
+export interface BroadcastTXParams {
+  hex: string
+  maxfeerate?: number | null | undefined
+  maxburnamount?: number | null | undefined
+}
 /** Query the Inscription via global index by Inscription filter */
 export interface QueryInscriptionsParams {
   filter: RpcTypes.InscriptionFilterView
@@ -24,6 +31,15 @@ export interface QueryUTXOsParams {
   cursor?: RpcTypes.IndexerStateIDView | null | undefined
   limit?: string | null | undefined
   descendingOrder?: boolean | null | undefined
+}
+/** Check change sets from sync states */
+export interface CheckChangeSetsParams {
+  cursor?: string | null | undefined
+  limit?: string | null | undefined
+  queryOption?: RpcTypes.QueryOptions | null | undefined
+}
+export interface DryRunRawTransactionParams {
+  txBcsHex: string
 }
 /**
  * Send the signed transaction in bcs hex format This method blocks waiting for the transaction to be
@@ -39,19 +55,19 @@ export interface ExecuteViewFunctionParams {
 }
 /** get account balance by RoochAddress and CoinType */
 export interface GetBalanceParams {
-  owner: string
+  owner: address
   coinType: string
 }
 /** get account balances by RoochAddress */
 export interface GetBalancesParams {
-  owner: string
+  owner: address
   cursor?: RpcTypes.IndexerStateIDView | null | undefined
   limit?: string | null | undefined
 }
 export interface GetChainIDParams {}
-/** Get the events by event handle id */
+/** Get the events by event handle type or event handle id */
 export interface GetEventsByEventHandleParams {
-  eventHandleType: string
+  eventHandle: string
   cursor?: string | null | undefined
   limit?: string | null | undefined
   descendingOrder?: boolean | null | undefined
@@ -70,7 +86,7 @@ export interface GetModuleABIParams {
 }
 /** Get object states by object id */
 export interface GetObjectStatesParams {
-  objectIds: string
+  ids: string[]
   stateOption?: RpcTypes.StateOptions | null | undefined
 }
 /**
@@ -113,6 +129,13 @@ export interface QueryEventsParams {
   limit?: string | null | undefined
   queryOption?: RpcTypes.QueryOptions | null | undefined
 }
+/** Query the fields indexer by field filter */
+export interface QueryFieldsParams {
+  filter: RpcTypes.FieldFilterView
+  page?: string | null | undefined
+  limit?: string | null | undefined
+  queryOption?: RpcTypes.QueryOptions | null | undefined
+}
 /** Query the object states indexer by state filter */
 export interface QueryObjectStatesParams {
   filter: RpcTypes.ObjectStateFilterView
@@ -127,10 +150,32 @@ export interface QueryTransactionsParams {
   limit?: string | null | undefined
   queryOption?: RpcTypes.QueryOptions | null | undefined
 }
+/** Repair indexer by sync from states */
+export interface RepairIndexerParams {
+  repairType: string
+  repairParams: RpcTypes.RepairIndexerParamsView
+}
 /**
  * Send the signed transaction in bcs hex format This method does not block waiting for the transaction
  * to be executed.
  */
 export interface SendRawTransactionParams {
   txBcsHex: string
+}
+/** Get the chain and service status */
+export interface StatusParams {}
+/** Subscribe to a stream of event */
+export interface SubscribeEventsParams {
+  filter: RpcTypes.EventFilterView
+}
+/** Subscribe to a stream of transaction with execution info */
+export interface SubscribeTransactionsParams {
+  filter: RpcTypes.TransactionFilterView
+}
+/** Sync state change sets */
+export interface SyncStatesParams {
+  filter: RpcTypes.SyncStateFilterView
+  cursor?: string | null | undefined
+  limit?: string | null | undefined
+  queryOption?: RpcTypes.QueryOptions | null | undefined
 }

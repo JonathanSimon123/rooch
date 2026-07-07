@@ -11,6 +11,8 @@
 -  [Function `transfer_coin_to_multichain_address`](#0x3_transfer_transfer_coin_to_multichain_address)
 -  [Function `transfer_object`](#0x3_transfer_transfer_object)
 -  [Function `transfer_object_to_bitcoin_address`](#0x3_transfer_transfer_object_to_bitcoin_address)
+-  [Function `transfer_coin_by_type_name`](#0x3_transfer_transfer_coin_by_type_name)
+-  [Function `transfer_object_batch`](#0x3_transfer_transfer_object_batch)
 
 
 <pre><code><b>use</b> <a href="">0x1::option</a>;
@@ -46,7 +48,7 @@ Transfer <code>amount</code> of coins <code>CoinType</code> from <code>from</cod
 This public entry function requires the <code>CoinType</code> to have <code>key</code> and <code>store</code> abilities.
 
 
-<pre><code><b>public</b> entry <b>fun</b> <a href="transfer.md#0x3_transfer_transfer_coin">transfer_coin</a>&lt;CoinType: store, key&gt;(from: &<a href="">signer</a>, <b>to</b>: <b>address</b>, amount: u256)
+<pre><code><b>public</b> entry <b>fun</b> <a href="transfer.md#0x3_transfer_transfer_coin">transfer_coin</a>&lt;CoinType: store, key&gt;(from: &<a href="">signer</a>, <b>to</b>: <b>address</b>, amount: <a href="">u256</a>)
 </code></pre>
 
 
@@ -58,7 +60,7 @@ This public entry function requires the <code>CoinType</code> to have <code>key<
 Transfer <code>amount</code> of coins <code>CoinType</code> from <code>from</code> to a Bitcoin Address.
 
 
-<pre><code><b>public</b> entry <b>fun</b> <a href="transfer.md#0x3_transfer_transfer_coin_to_bitcoin_address">transfer_coin_to_bitcoin_address</a>&lt;CoinType: store, key&gt;(from: &<a href="">signer</a>, <b>to</b>: <a href="_String">string::String</a>, amount: u256)
+<pre><code><b>public</b> entry <b>fun</b> <a href="transfer.md#0x3_transfer_transfer_coin_to_bitcoin_address">transfer_coin_to_bitcoin_address</a>&lt;CoinType: store, key&gt;(from: &<a href="">signer</a>, <b>to</b>: <a href="_String">string::String</a>, amount: <a href="">u256</a>)
 </code></pre>
 
 
@@ -72,7 +74,7 @@ The MultiChainAddress is represented by <code>multichain_id</code> and <code>raw
 This public entry function requires the <code>CoinType</code> to have <code>key</code> and <code>store</code> abilities.
 
 
-<pre><code><b>public</b> entry <b>fun</b> <a href="transfer.md#0x3_transfer_transfer_coin_to_multichain_address">transfer_coin_to_multichain_address</a>&lt;CoinType: store, key&gt;(from: &<a href="">signer</a>, multichain_id: u64, raw_address: <a href="">vector</a>&lt;u8&gt;, amount: u256)
+<pre><code><b>public</b> entry <b>fun</b> <a href="transfer.md#0x3_transfer_transfer_coin_to_multichain_address">transfer_coin_to_multichain_address</a>&lt;CoinType: store, key&gt;(from: &<a href="">signer</a>, multichain_id: u64, raw_address: <a href="">vector</a>&lt;u8&gt;, amount: <a href="">u256</a>)
 </code></pre>
 
 
@@ -97,4 +99,28 @@ Transfer <code>from</code> owned <code>Object&lt;T&gt;</code> to a Bitcoin Addre
 
 
 <pre><code><b>public</b> entry <b>fun</b> <a href="transfer.md#0x3_transfer_transfer_object_to_bitcoin_address">transfer_object_to_bitcoin_address</a>&lt;T: store, key&gt;(<b>to</b>: <a href="_String">string::String</a>, obj: <a href="_Object">object::Object</a>&lt;T&gt;)
+</code></pre>
+
+
+
+<a name="0x3_transfer_transfer_coin_by_type_name"></a>
+
+## Function `transfer_coin_by_type_name`
+
+Direct transfer by coin type name
+
+
+<pre><code><b>public</b> entry <b>fun</b> <a href="transfer.md#0x3_transfer_transfer_coin_by_type_name">transfer_coin_by_type_name</a>(from: &<a href="">signer</a>, <b>to</b>: <b>address</b>, coin_type: <a href="_String">string::String</a>, amount: <a href="">u256</a>)
+</code></pre>
+
+
+
+<a name="0x3_transfer_transfer_object_batch"></a>
+
+## Function `transfer_object_batch`
+
+Batch transfer <code>Object&lt;T&gt;</code> from <code>from</code> to <code><b>to</b></code>.
+
+
+<pre><code><b>public</b> entry <b>fun</b> <a href="transfer.md#0x3_transfer_transfer_object_batch">transfer_object_batch</a>&lt;T: store, key&gt;(from: &<a href="">signer</a>, <b>to</b>: <b>address</b>, object_ids: <a href="">vector</a>&lt;<a href="_ObjectID">object::ObjectID</a>&gt;)
 </code></pre>

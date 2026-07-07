@@ -610,6 +610,7 @@ impl MoveType for [u8] {
 
 /// A placeholder struct for unknown Move Struct
 /// Sometimes we need a generic struct type, but we don't know the struct type
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct PlaceholderStruct;
 
 impl MoveStructType for PlaceholderStruct {
@@ -618,6 +619,12 @@ impl MoveStructType for PlaceholderStruct {
     const STRUCT_NAME: &'static IdentStr = ident_str!("PlaceholderStruct");
 
     fn type_params() -> Vec<TypeTag> {
+        panic!("PlaceholderStruct should not be used as a type")
+    }
+}
+
+impl MoveStructState for PlaceholderStruct {
+    fn struct_layout() -> MoveStructLayout {
         panic!("PlaceholderStruct should not be used as a type")
     }
 }
@@ -683,8 +690,8 @@ impl ObjectState {
         Self::new_with_struct(metadata, timestamp).expect("Create Timestamp Object should success")
     }
 
-    /// Create ModuleStore Object
-    pub fn new_module_store() -> Self {
+    /// Create Genesis ModuleStore Object
+    pub fn genesis_module_store() -> Self {
         let id = ModuleStore::object_id();
         let mut metadata = ObjectMeta::genesis_meta(id, ModuleStore::type_tag());
         metadata.to_shared();
@@ -892,9 +899,10 @@ impl AnnotatedState {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObjectChange {
     pub metadata: ObjectMeta,
+    #[serde(with = "op_serde")]
     pub value: Option<Op<Vec<u8>>>,
     pub fields: BTreeMap<FieldKey, ObjectChange>,
 }
@@ -916,8 +924,32 @@ impl ObjectChange {
         }
     }
 
-    pub fn add_field_change(&mut self, key: FieldKey, field_change: ObjectChange) {
+    pub fn new_object(object: ObjectState) -> Self {
+        let (metadata, value) = object.into_inner();
+        Self::new(metadata, Op::New(value))
+    }
+
+    pub fn add_field_change(&mut self, field_change: ObjectChange) -> Result<()> {
+        ensure!(
+            field_change.metadata.id.parent() == Some(self.metadata.id.clone()),
+            "FieldChange id parent not match with ObjectChange id: {:?} != {:?}",
+            field_change.metadata.id,
+            self.metadata.id
+        );
+        if let Some(op) = &field_change.value {
+            match op {
+                Op::New(_) => {
+                    self.metadata.size += 1;
+                }
+                Op::Delete => {
+                    self.metadata.size -= 1;
+                }
+                Op::Modify(_) => {}
+            }
+        }
+        let key = field_change.metadata.id.field_key();
         self.fields.insert(key, field_change);
+        Ok(())
     }
 
     pub fn update_state_root(&mut self, new_state_root: H256) {
@@ -927,7 +959,7 @@ impl ObjectChange {
 
 /// Global State change set.
 /// The state_root in the ObjectChange is the state_root before the changes
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StateChangeSet {
     /// The state root of the root Object
     pub state_root: H256,
@@ -937,12 +969,62 @@ pub struct StateChangeSet {
 }
 
 impl StateChangeSet {
+    pub fn new(state_root: H256, global_size: u64) -> Self {
+        Self {
+            state_root,
+            global_size,
+            changes: BTreeMap::new(),
+        }
+    }
+
+    pub fn new_with_changes(
+        state_root: H256,
+        global_size: u64,
+        changes: BTreeMap<FieldKey, ObjectChange>,
+    ) -> Self {
+        Self {
+            state_root,
+            global_size,
+            changes,
+        }
+    }
+
     pub fn root_metadata(&self) -> ObjectMeta {
         ObjectMeta::root_metadata(self.state_root, self.global_size)
     }
 
     pub fn update_state_root(&mut self, new_state_root: H256) {
         self.state_root = new_state_root;
+    }
+
+    pub fn add_change(&mut self, change: ObjectChange) -> Result<()> {
+        let id = change.metadata.id.clone();
+        let parent = id.parent().expect("No root ObjectChange have parent");
+        if parent.is_root() {
+            let key = id.field_key();
+            if let Some(op) = &change.value {
+                match op {
+                    Op::New(_) => self.global_size += 1,
+                    Op::Delete => self.global_size -= 1,
+                    Op::Modify(_) => {}
+                }
+            }
+            self.changes.insert(key, change);
+        } else {
+            let parent_key = parent.field_key();
+            let parent_change = self
+                .changes
+                .get_mut(&parent_key)
+                .ok_or_else(|| anyhow::anyhow!("Parent ObjectChange not found for id: {:?}", id))?;
+            parent_change.add_field_change(change)?;
+        }
+        Ok(())
+    }
+
+    pub fn add_new_object(&mut self, object: ObjectState) -> Result<()> {
+        let (metadata, value) = object.into_inner();
+        let change = ObjectChange::new(metadata, Op::New(value));
+        self.add_change(change)
     }
 }
 
@@ -953,6 +1035,75 @@ impl Default for StateChangeSet {
             global_size: 0,
             changes: BTreeMap::new(),
         }
+    }
+}
+
+/// Global State change set ext.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct StateChangeSetExt {
+    /// The state change set
+    pub state_change_set: StateChangeSet,
+    /// Sequence number of this transaction corresponding to sender's account.
+    pub sequence_number: u64,
+}
+
+impl StateChangeSetExt {
+    pub fn new(state_change_set: StateChangeSet, sequence_number: u64) -> Self {
+        Self {
+            state_change_set,
+            sequence_number,
+        }
+    }
+}
+
+mod op_serde {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+    pub enum SerializableOp<T> {
+        New(T),
+        Modify(T),
+        Delete,
+    }
+
+    impl<T> From<Op<T>> for SerializableOp<T> {
+        fn from(op: Op<T>) -> Self {
+            match op {
+                Op::New(value) => SerializableOp::New(value),
+                Op::Modify(value) => SerializableOp::Modify(value),
+                Op::Delete => SerializableOp::Delete,
+            }
+        }
+    }
+
+    impl<T> From<SerializableOp<T>> for Op<T> {
+        fn from(op: SerializableOp<T>) -> Self {
+            match op {
+                SerializableOp::New(value) => Op::New(value),
+                SerializableOp::Modify(value) => Op::Modify(value),
+                SerializableOp::Delete => Op::Delete,
+            }
+        }
+    }
+
+    pub fn serialize<S, T>(option_op: &Option<Op<T>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        T: Serialize + Clone,
+    {
+        let op = option_op.as_ref().cloned();
+        op.map(SerializableOp::from).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D, T>(deserializer: D) -> Result<Option<Op<T>>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: Deserialize<'de>,
+    {
+        let op = Option::<SerializableOp<T>>::deserialize(deserializer)
+            .map_err(|e| D::Error::custom(format!("Deserialize the Op<T> error: {:?}", e)))?;
+        Ok(op.map(Op::from))
     }
 }
 
@@ -986,7 +1137,7 @@ mod tests {
         //test string
         field_key_derive_test(
             "1",
-            "0xc62df9a91eae549c2ff104f121549251c748185d0a21d5018c87db4be47fd191",
+            "0x5c01fed5cc173458597a3d55ec9942f1a385d5aa66f15e3615378d8a773e4d58",
         );
         //test u8
         field_key_derive_test(
@@ -1003,5 +1154,58 @@ mod tests {
             &AccountAddress::ONE,
             "0x07d29b5cffb95d39f98baed1a973e676891bc9d379022aba6f4a2e4912a5e552",
         );
+    }
+
+    /// Ensure delete+new on same field in one StateChangeSet folds to final state.
+    #[test]
+    fn test_fold_delete_then_new_same_field() {
+        let root_id = ObjectID::root();
+        let field = FieldKey::derive_from_string("foo");
+        let child_id = root_id.child_id(field);
+
+        // Start with a pre-existing field (global_size = 1)
+        let mut scs = StateChangeSet::new(*GENESIS_STATE_ROOT, 1);
+
+        // First, mark delete
+        let delete_change = ObjectChange::new(
+            ObjectMeta::new(
+                child_id.clone(),
+                AccountAddress::ZERO,
+                0,
+                Some(*GENESIS_STATE_ROOT),
+                0,
+                0,
+                0,
+                TypeTag::Bool,
+            ),
+            Op::Delete,
+        );
+        scs.add_change(delete_change).unwrap();
+
+        // Then, add back a new value (should overwrite delete)
+        let new_change = ObjectChange::new(
+            ObjectMeta::new(
+                child_id.clone(),
+                AccountAddress::ZERO,
+                0,
+                Some(*GENESIS_STATE_ROOT),
+                0,
+                0,
+                0,
+                TypeTag::Bool,
+            ),
+            Op::New(vec![1, 2, 3, 4]),
+        );
+        scs.add_change(new_change).unwrap();
+
+        // Only one entry should remain, with final Op::New
+        assert_eq!(scs.changes.len(), 1);
+        let change = scs.changes.values().next().unwrap();
+        match change.value.as_ref().unwrap() {
+            Op::New(v) => assert_eq!(v, &vec![1, 2, 3, 4]),
+            _ => panic!("expected final Op::New after overwrite"),
+        }
+        // Global size should be back to 1 (delete then add)
+        assert_eq!(scs.global_size, 1);
     }
 }

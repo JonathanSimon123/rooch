@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{EVENT_COLUMN_FAMILY_NAME, EVENT_HANDLE_COLUMN_FAMILY_NAME};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use move_core_types::language_storage::StructTag;
 use moveos_types::moveos_std::event::{Event, EventHandle, EventID, TransactionEvent};
 use moveos_types::moveos_std::object::ObjectID;
@@ -66,8 +66,7 @@ impl EventDBStore {
         self.event_handle_store.kv_get(event_handle_id)
     }
 
-    fn get_or_create_event_handle(&self, event_handle_type: &StructTag) -> Result<EventHandle> {
-        let event_handle_id = EventHandle::derive_event_handle_id(event_handle_type);
+    fn get_or_create_event_handle(&self, event_handle_id: ObjectID) -> Result<EventHandle> {
         let event_handle = self.get_event_handle(event_handle_id.clone())?;
         if let Some(event_handle) = event_handle {
             return Ok(event_handle);
@@ -83,15 +82,15 @@ impl EventDBStore {
     }
 
     pub fn save_events(&self, tx_events: Vec<TransactionEvent>) -> Result<Vec<EventID>> {
-        let event_types = tx_events
+        let event_handle_ids = tx_events
             .iter()
-            .map(|event| event.event_type.clone())
+            .map(|event| event.event_handle_id.clone())
             .collect::<HashSet<_>>();
-        let mut event_handles = event_types
+        let mut event_handles = event_handle_ids
             .into_iter()
-            .map(|event_type| {
-                let handle = self.get_or_create_event_handle(&event_type)?;
-                Ok((event_type, handle))
+            .map(|event_handle_id| {
+                let handle = self.get_or_create_event_handle(event_handle_id.clone())?;
+                Ok((event_handle_id, handle))
             })
             .collect::<Result<HashMap<_, _>>>()?;
         let mut event_ids = vec![];
@@ -99,7 +98,7 @@ impl EventDBStore {
             .into_iter()
             .map(|tx_event| {
                 let handle = event_handles
-                    .get_mut(&tx_event.event_type)
+                    .get_mut(&tx_event.event_handle_id)
                     .expect("Event handle must exist");
                 let event_id = EventID::new(handle.id.clone(), handle.count);
                 let event = Event::new(
@@ -146,18 +145,14 @@ impl EventDBStore {
         limit: u64,
         descending_order: bool,
     ) -> Result<Vec<Event>> {
-        let event_handle = self
-            .get_event_handle(event_handle_id.clone())?
-            .ok_or_else(|| {
-                anyhow!(
-                    "Can not find event handle by id: {}",
-                    event_handle_id.to_string()
-                )
-            })?;
+        let event_handle = self.get_event_handle(event_handle_id.clone())?;
+        if event_handle.is_none() {
+            return Ok(vec![]);
+        }
+        let event_handle = event_handle.unwrap();
         let last_seq = event_handle.count;
-
         let ids = if descending_order {
-            let start = cursor.unwrap_or(last_seq + 1);
+            let start = cursor.unwrap_or(last_seq);
             let end = if start >= limit { start - limit } else { 0 };
 
             (end..start).rev().collect::<Vec<_>>()

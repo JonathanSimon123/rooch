@@ -1,14 +1,14 @@
 // Copyright (c) RoochNetwork
 // SPDX-License-Identifier: Apache-2.0
 
-use super::messages::{GetReadyL1BlockMessage, GetReadyL1TxsMessage, SyncTick};
-use crate::actor::bitcoin_client_proxy::BitcoinClientProxy;
+use crate::actor::messages::{GetReadyL1BlockMessage, GetReadyL1TxsMessage, SyncTick};
 use anyhow::Result;
 use async_trait::async_trait;
-use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash};
+use bitcoin_client::proxy::BitcoinClientProxy;
 use bitcoincore_rpc::bitcoincore_rpc_json::GetBlockHeaderResult;
 use coerce::actor::{context::ActorContext, message::Handler, Actor};
+use indexmap::IndexMap;
 use moveos_types::module_binding::MoveFunctionCaller;
 use rooch_config::BitcoinRelayerConfig;
 use rooch_executor::proxy::ExecutorProxy;
@@ -17,8 +17,10 @@ use rooch_types::into_address::{FromAddress, IntoAddress};
 use rooch_types::{
     bitcoin::{pending_block::PendingBlockModule, BitcoinModule},
     multichain_id::RoochMultiChainID,
-    transaction::{L1Block, L1BlockWithBody, L1Transaction},
+    transaction::{L1BlockWithBody, L1Transaction},
 };
+use std::io::Write;
+use std::path::PathBuf;
 use tracing::{debug, error, info};
 
 pub struct BitcoinRelayer {
@@ -32,6 +34,7 @@ pub struct BitcoinRelayer {
     latest_sync_timestamp: u64,
     sync_to_latest: bool,
     batch_size: usize,
+    reorg_aware_store: BitcoinReorgAwareStore,
 }
 
 #[derive(Debug, Clone)]
@@ -53,18 +56,23 @@ impl BitcoinRelayer {
         Ok(Self {
             genesis_block,
             end_block_height: config.btc_end_block_height,
-            rpc_client,
+            rpc_client: rpc_client.clone(),
             move_caller: executor,
             buffer: vec![],
             sync_block_interval,
             latest_sync_timestamp: 0u64,
             sync_to_latest: false,
-            batch_size: 10,
+            batch_size: 5,
+            reorg_aware_store: BitcoinReorgAwareStore::new(
+                config.btc_reorg_aware_block_store_dir,
+                config.btc_reorg_aware_height,
+                rpc_client,
+            ),
         })
     }
 
     async fn sync_block(&mut self) -> Result<()> {
-        if !self.buffer.is_empty() {
+        if self.buffer.len() > self.batch_size {
             return Ok(());
         }
         if self.sync_to_latest
@@ -77,7 +85,17 @@ impl BitcoinRelayer {
         self.latest_sync_timestamp = chrono::Utc::now().timestamp() as u64;
 
         let pending_block_module = self.move_caller.as_module_binding::<PendingBlockModule>();
-        let best_block_in_rooch = pending_block_module.get_best_block()?;
+        let best_block_in_rooch = if self.buffer.is_empty() {
+            pending_block_module.get_best_block()?
+        } else {
+            let last_block = self.buffer.last().unwrap();
+            let last_block_hash = last_block.header_info.hash;
+            let last_block_height = last_block.header_info.height;
+            Some(BlockHeightHash {
+                block_hash: last_block_hash.into_address(),
+                block_height: last_block_height as u64,
+            })
+        };
         let best_block_hash_in_bitcoin = self.rpc_client.get_best_block_hash().await?;
 
         //The start block is included
@@ -119,6 +137,7 @@ impl BitcoinRelayer {
 
         let mut next_block_hash = start_block_hash;
 
+        let mut batch_count = 0;
         while let Some(next_hash) = next_block_hash {
             let header_info = self.rpc_client.get_block_header_info(next_hash).await?;
             let block = self.rpc_client.get_block(next_hash).await?;
@@ -133,11 +152,28 @@ impl BitcoinRelayer {
                 );
                 break;
             }
+
+            // store potential reorg block before consuming by VM(push to buffer),
+            // avoiding inconsistency caused by collapse
+            self.reorg_aware_store
+                .insert_or_replace(
+                    next_block_height,
+                    header_info.hash,
+                    header_info.previous_block_hash,
+                )
+                .await?;
+
+            info!(
+                "BitcoinRelayer buffer block, height: {}, hash: {:?}",
+                next_block_height, header_info.hash
+            );
             self.buffer.push(BlockResult { header_info, block });
-            if self.buffer.len() > self.batch_size {
+            if batch_count > self.batch_size {
                 break;
             }
+            batch_count += 1;
         }
+
         Ok(())
     }
 
@@ -151,22 +187,16 @@ impl BitcoinRelayer {
             let time = block_result.block.header.time;
             let tx_size = block_result.block.txdata.len();
             info!(
-                "BitcoinRelayer process block, height: {}, hash: {}, tx_size: {}, time: {}",
+                "BitcoinRelayer process block, height: {}, hash: {:?}, tx_size: {}, time: {}",
                 block_height, block_hash, tx_size, time
             );
             debug!("GetBlockHeaderResult: {:?}", block_result);
 
-            let block_height = block_result.header_info.height;
-            let block_body = rooch_types::bitcoin::types::Block::from(block_result.block);
-
-            Ok(Some(L1BlockWithBody {
-                block: L1Block {
-                    chain_id: RoochMultiChainID::Bitcoin.multichain_id(),
-                    block_height: block_height as u64,
-                    block_hash: block_hash.to_byte_array().to_vec(),
-                },
-                block_body: block_body.encode(),
-            }))
+            let block_height = block_result.header_info.height as u64;
+            Ok(Some(L1BlockWithBody::new_bitcoin_block(
+                block_height,
+                block_result.block,
+            )))
         }
     }
 
@@ -232,5 +262,91 @@ impl Handler<GetReadyL1TxsMessage> for BitcoinRelayer {
         _ctx: &mut ActorContext,
     ) -> Result<Vec<L1Transaction>> {
         self.get_ready_l1_txs()
+    }
+}
+
+pub struct BitcoinReorgAwareStore {
+    block_store_dir: PathBuf,
+    recent_blocks_map: IndexMap<u64, BlockHash>,
+    aware_height: usize,
+    rpc_client: BitcoinClientProxy,
+}
+
+impl BitcoinReorgAwareStore {
+    pub fn new(
+        block_store_dir: PathBuf,
+        aware_height: usize,
+        rpc_client: BitcoinClientProxy,
+    ) -> Self {
+        Self {
+            block_store_dir,
+            recent_blocks_map: IndexMap::with_capacity(aware_height),
+            aware_height,
+            rpc_client,
+        }
+    }
+
+    pub async fn insert_or_replace(
+        &mut self,
+        block_height: u64,
+        block_hash: BlockHash,
+        previous_block_hash_opt: Option<BlockHash>,
+    ) -> Result<()> {
+        if self.recent_blocks_map.is_empty() && previous_block_hash_opt.is_some() {
+            self.fill_recent_blocks_with_previous(block_height, previous_block_hash_opt)
+                .await?;
+        }
+
+        // Handle replacement if block height already exists in the map
+        if let Some(original_hash) = self.recent_blocks_map.insert(block_height, block_hash) {
+            let original_block = self.rpc_client.get_block(original_hash).await?;
+            self.write_block_to_store(original_hash, &original_block)
+                .await?;
+        }
+
+        // Handle removing the smallest-height block when reaching aware_height
+        if self.recent_blocks_map.len() > self.aware_height {
+            self.recent_blocks_map.shift_remove_index(0);
+        }
+
+        Ok(())
+    }
+
+    async fn write_block_to_store(&self, block_hash: BlockHash, block: &Block) -> Result<()> {
+        let block_output_path = self.block_store_dir.join(block_hash.to_string());
+        let mut block_file = std::fs::File::create(block_output_path)?;
+        let block_hex: String = bitcoin::consensus::encode::serialize_hex(block);
+        block_file.write_all(block_hex.as_bytes())?;
+        block_file.sync_data()?; // ok to block here, low frequency operation
+        Ok(())
+    }
+
+    async fn fill_recent_blocks_with_previous(
+        &mut self,
+        mut block_height: u64,
+        mut previous_block_hash_opt: Option<BlockHash>,
+    ) -> Result<()> {
+        let mut init_recent_blocks = Vec::with_capacity(self.aware_height - 1);
+
+        for _ in 1..self.aware_height {
+            if let Some(previous_block_hash) = previous_block_hash_opt {
+                init_recent_blocks.push((block_height - 1, previous_block_hash));
+                previous_block_hash_opt = self.get_previous_block_hash(previous_block_hash).await?;
+                block_height -= 1;
+            } else {
+                break;
+            }
+        }
+
+        init_recent_blocks.reverse();
+        for (height, hash) in init_recent_blocks {
+            self.recent_blocks_map.insert(height, hash);
+        }
+        Ok(())
+    }
+
+    async fn get_previous_block_hash(&self, block_hash: BlockHash) -> Result<Option<BlockHash>> {
+        let header_info = self.rpc_client.get_block_header_info(block_hash).await?;
+        Ok(header_info.previous_block_hash)
     }
 }

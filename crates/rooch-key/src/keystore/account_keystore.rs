@@ -69,7 +69,43 @@ pub trait AccountKeystore {
         Ok(result)
     }
 
+    fn export_mnemonic_phrase(
+        &mut self,
+        password: Option<String>,
+    ) -> Result<String, anyhow::Error> {
+        // load mnemonic phrase from keystore
+        let mnemonic = self.get_mnemonic(password.clone())?;
+        let mnemonic_phrase = mnemonic.mnemonic_phrase;
+        Ok(mnemonic_phrase)
+    }
+
+    fn import_external_account(
+        &mut self,
+        address: RoochAddress,
+        kp: RoochKeyPair,
+        password: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        let private_key_encryption = EncryptionData::encrypt_with_type(&kp, password)?;
+        self.add_address_encryption_data_to_keys(address, private_key_encryption)?;
+        Ok(())
+    }
+
+    /// Get all local accounts
+    //TODO refactor the keystore, save the public key out of the encryption data, so that we don't need to require password to get the public key
     fn get_accounts(&self, password: Option<String>) -> Result<Vec<LocalAccount>, anyhow::Error>;
+
+    /// Get local account by address
+    fn get_account(
+        &self,
+        address: &RoochAddress,
+        password: Option<String>,
+    ) -> Result<Option<LocalAccount>, anyhow::Error> {
+        let accounts = self.get_accounts(password)?;
+        let account = accounts.iter().find(|account| account.address == *address);
+        Ok(account.cloned())
+    }
+
+    fn contains_address(&self, address: &RoochAddress) -> bool;
 
     fn add_address_encryption_data_to_keys(
         &mut self,
@@ -137,6 +173,13 @@ pub trait AccountKeystore {
         address: RoochAddress,
         session_key: SessionKey,
     ) -> Result<(), anyhow::Error>;
+
+    fn get_session_key(
+        &self,
+        address: &RoochAddress,
+        authentication_key: &AuthenticationKey,
+        password: Option<String>,
+    ) -> Result<Option<RoochKeyPair>, anyhow::Error>;
 
     fn sign_transaction_via_session_key(
         &self,

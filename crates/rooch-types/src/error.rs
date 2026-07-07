@@ -1,6 +1,7 @@
 // Copyright (c) RoochNetwork
 // SPDX-License-Identifier: Apache-2.0
 
+use coerce::actor::ActorRefErr;
 use move_binary_format::errors::VMError;
 use moveos_types::genesis_info::GenesisInfo;
 use std::io;
@@ -50,6 +51,8 @@ pub enum RoochError {
     SignMessageError(String),
     #[error("Transaction error: {0}")]
     TransactionError(String),
+    #[error("DryRun Transaction error: {0}")]
+    DryRunTransactionError(String),
     #[error("View function error: {0}")]
     ViewFunctionError(String),
     #[error("Import account error: {0}")]
@@ -120,13 +123,40 @@ pub enum RoochError {
     #[error("Invalid sequencer or proposer or relayer key pair")]
     InvalidSequencerOrProposerOrRelayerKeyPair,
 
+    #[error("The local gas_config version {0} is lower than the onchain version {1}")]
+    InvalidLocalGasVersion(u64, u64),
+
+    #[error("The content length of local gas schedule is less")]
+    LessLocalGasScheduleLength,
+
+    #[error("The content of local gas schedule must be subset of onchain gas schedule")]
+    LocalIncorrectGasSchedule,
+
+    #[error("The onchain gas schedule is empty.")]
+    OnchainGasScheduleIsEmpty,
+
+    #[error("The l1 tx has been executed.")]
+    L1TxAlreadyExecuted,
+
     #[error("VM error: {0}")]
     VMError(VMError),
+
+    // Add new variant for ActorRefErr
+    #[error("Actor reference error: {0}")]
+    ActorRefError(String),
+
+    #[error("Failed to dispatch subscription: {0}")]
+    FailedToDispatchSubscription(String),
 }
 
 impl From<anyhow::Error> for RoochError {
     fn from(e: anyhow::Error) -> Self {
-        RoochError::UnexpectedError(e.to_string())
+        let message = e
+            .chain()
+            .map(|e| e.to_string())
+            .collect::<Vec<String>>()
+            .join("\n");
+        RoochError::UnexpectedError(message)
     }
 }
 
@@ -142,6 +172,12 @@ impl From<io::Error> for RoochError {
     }
 }
 
+impl From<bitcoin::io::Error> for RoochError {
+    fn from(e: bitcoin::io::Error) -> Self {
+        RoochError::IOError(e.to_string())
+    }
+}
+
 impl From<VMError> for RoochError {
     fn from(e: VMError) -> Self {
         RoochError::VMError(e)
@@ -151,6 +187,24 @@ impl From<VMError> for RoochError {
 impl From<serde_json::Error> for RoochError {
     fn from(e: serde_json::Error) -> Self {
         RoochError::UnexpectedError(e.to_string())
+    }
+}
+
+impl From<bitcoin::psbt::Error> for RoochError {
+    fn from(e: bitcoin::psbt::Error) -> Self {
+        RoochError::CommandArgumentError(e.to_string())
+    }
+}
+
+impl From<hex::FromHexError> for RoochError {
+    fn from(e: hex::FromHexError) -> Self {
+        RoochError::CommandArgumentError(e.to_string())
+    }
+}
+
+impl From<ActorRefErr> for RoochError {
+    fn from(e: ActorRefErr) -> Self {
+        RoochError::ActorRefError(e.to_string())
     }
 }
 

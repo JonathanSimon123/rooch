@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::actor::messages::{
-    GetEventsByEventHandleMessage, GetEventsByEventIDsMessage, GetTxExecutionInfosByHashMessage,
-    ListAnnotatedStatesMessage, ListStatesMessage, RefreshStateMessage, ValidateL1BlockMessage,
+    CheckStateChangeSetsMessage, ConvertL2TransactionData, DryRunTransactionResult,
+    GetAnnotatedEventsByEventIDsMessage, GetEventsByEventHandleMessage, GetEventsByEventIDsMessage,
+    GetStateChangeSetsMessage, GetTxExecutionInfosByHashMessage, ListAnnotatedStatesMessage,
+    ListStatesMessage, RefreshStateMessage, SaveStateChangeSetMessage, ValidateL1BlockMessage,
     ValidateL1TxMessage,
 };
 use crate::actor::reader_executor::ReaderExecutorActor;
@@ -14,18 +16,17 @@ use crate::actor::{
         StatesMessage, ValidateL2TxMessage,
     },
 };
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use coerce::actor::ActorRef;
 use move_core_types::account_address::AccountAddress;
-use move_core_types::language_storage::StructTag;
 use moveos_types::function_return_value::{AnnotatedFunctionResult, FunctionResult};
 use moveos_types::h256::H256;
 use moveos_types::module_binding::MoveFunctionCaller;
 use moveos_types::moveos_std::account::Account;
 use moveos_types::moveos_std::event::{Event, EventID};
-use moveos_types::moveos_std::object::ObjectMeta;
+use moveos_types::moveos_std::object::{ObjectID, ObjectMeta};
 use moveos_types::moveos_std::tx_context::TxContext;
-use moveos_types::state::FieldKey;
+use moveos_types::state::{FieldKey, StateChangeSetExt};
 use moveos_types::state_resolver::{AnnotatedStateKV, StateKV};
 use moveos_types::transaction::FunctionCall;
 use moveos_types::transaction::TransactionExecutionInfo;
@@ -37,7 +38,9 @@ use moveos_types::{
 };
 use rooch_types::bitcoin::network::BitcoinNetwork;
 use rooch_types::framework::chain_id::ChainID;
-use rooch_types::transaction::{L1BlockWithBody, L1Transaction, RoochTransaction};
+use rooch_types::transaction::{
+    L1BlockWithBody, L1Transaction, RoochTransaction, RoochTransactionData,
+};
 use tokio::runtime::Handle;
 
 #[derive(Clone)]
@@ -68,20 +71,50 @@ impl ExecutorProxy {
         self.actor.send(ValidateL1BlockMessage { l1_block }).await?
     }
 
-    pub async fn validate_l1_tx(&self, l1_tx: L1Transaction) -> Result<VerifiedMoveOSTransaction> {
-        self.actor.send(ValidateL1TxMessage { l1_tx }).await?
+    pub async fn validate_l1_tx(
+        &self,
+        l1_tx: L1Transaction,
+        bypass_executed_check: bool,
+    ) -> Result<VerifiedMoveOSTransaction> {
+        self.actor
+            .send(ValidateL1TxMessage {
+                l1_tx,
+                bypass_executed_check,
+            })
+            .await?
+    }
+
+    pub async fn convert_to_verified_tx(
+        &self,
+        tx_data: RoochTransactionData,
+    ) -> Result<VerifiedMoveOSTransaction> {
+        self.actor
+            .send(ConvertL2TransactionData { tx_data })
+            .await?
     }
 
     //TODO ensure the execute result
     pub async fn execute_transaction(
         &self,
         tx: VerifiedMoveOSTransaction,
+        tx_order: u64,
     ) -> Result<(TransactionOutput, TransactionExecutionInfo)> {
         let result = self
             .actor
-            .send(crate::actor::messages::ExecuteTransactionMessage { tx })
+            .send(crate::actor::messages::ExecuteTransactionMessage { tx, tx_order })
             .await??;
         Ok((result.output, result.transaction_info))
+    }
+
+    pub async fn dry_run_transaction(
+        &self,
+        tx: VerifiedMoveOSTransaction,
+    ) -> Result<DryRunTransactionResult> {
+        let result = self
+            .actor
+            .send(crate::actor::messages::DryRunTransactionMessage { tx })
+            .await??;
+        Ok(result)
     }
 
     pub async fn execute_view_function(
@@ -93,29 +126,42 @@ impl ExecutorProxy {
             .await?
     }
 
-    pub async fn get_states(&self, access_path: AccessPath) -> Result<Vec<Option<ObjectState>>> {
+    pub async fn get_states(
+        &self,
+        access_path: AccessPath,
+        state_root: Option<H256>,
+    ) -> Result<Vec<Option<ObjectState>>> {
         self.reader_actor
-            .send(StatesMessage { access_path })
+            .send(StatesMessage {
+                state_root,
+                access_path,
+            })
             .await?
     }
 
     pub async fn get_annotated_states(
         &self,
         access_path: AccessPath,
+        state_root: Option<H256>,
     ) -> Result<Vec<Option<AnnotatedState>>> {
         self.reader_actor
-            .send(AnnotatedStatesMessage { access_path })
+            .send(AnnotatedStatesMessage {
+                state_root,
+                access_path,
+            })
             .await?
     }
 
     pub async fn list_states(
         &self,
+        state_root: Option<H256>,
         access_path: AccessPath,
         cursor: Option<FieldKey>,
         limit: usize,
     ) -> Result<Vec<StateKV>> {
         self.reader_actor
             .send(ListStatesMessage {
+                state_root,
                 access_path,
                 cursor,
                 limit,
@@ -125,12 +171,14 @@ impl ExecutorProxy {
 
     pub async fn list_annotated_states(
         &self,
+        state_root: Option<H256>,
         access_path: AccessPath,
         cursor: Option<FieldKey>,
         limit: usize,
     ) -> Result<Vec<AnnotatedStateKV>> {
         self.reader_actor
             .send(ListAnnotatedStatesMessage {
+                state_root,
                 access_path,
                 cursor,
                 limit,
@@ -140,14 +188,14 @@ impl ExecutorProxy {
 
     pub async fn get_annotated_events_by_event_handle(
         &self,
-        event_handle_type: StructTag,
+        event_handle_id: ObjectID,
         cursor: Option<u64>,
         limit: u64,
         descending_order: bool,
     ) -> Result<Vec<AnnotatedEvent>> {
         self.reader_actor
             .send(GetAnnotatedEventsByEventHandleMessage {
-                event_handle_type,
+                event_handle_id,
                 cursor,
                 limit,
                 descending_order,
@@ -157,14 +205,14 @@ impl ExecutorProxy {
 
     pub async fn get_events_by_event_handle(
         &self,
-        event_handle_type: StructTag,
+        event_handle_id: ObjectID,
         cursor: Option<u64>,
         limit: u64,
         descending_order: bool,
     ) -> Result<Vec<Event>> {
         self.reader_actor
             .send(GetEventsByEventHandleMessage {
-                event_handle_type,
+                event_handle_id,
                 cursor,
                 limit,
                 descending_order,
@@ -172,10 +220,19 @@ impl ExecutorProxy {
             .await?
     }
 
-    pub async fn get_events_by_event_ids(
+    pub async fn get_annotated_events_by_event_ids(
         &self,
         event_ids: Vec<EventID>,
     ) -> Result<Vec<Option<AnnotatedEvent>>> {
+        self.reader_actor
+            .send(GetAnnotatedEventsByEventIDsMessage { event_ids })
+            .await?
+    }
+
+    pub async fn get_events_by_event_ids(
+        &self,
+        event_ids: Vec<EventID>,
+    ) -> Result<Vec<Option<Event>>> {
         self.reader_actor
             .send(GetEventsByEventIDsMessage { event_ids })
             .await?
@@ -196,17 +253,50 @@ impl ExecutorProxy {
             .await?
     }
 
+    /// Get latest root object
+    pub async fn get_root(&self) -> Result<ObjectState> {
+        self.actor
+            .send(crate::actor::messages::GetRootMessage {})
+            .await?
+    }
+
     // This is a workaround function to sync the state of the executor to reader
     pub async fn sync_state(&self) -> Result<()> {
-        let root = self
-            .actor
-            .send(crate::actor::messages::GetRootMessage {})
-            .await??;
+        let root = self.get_root().await?;
         self.refresh_state(root.metadata, false).await
     }
 
+    pub async fn save_state_change_set(
+        &self,
+        tx_order: u64,
+        state_change_set: StateChangeSetExt,
+    ) -> Result<()> {
+        self.actor
+            .notify(SaveStateChangeSetMessage {
+                tx_order,
+                state_change_set,
+            })
+            .await
+            .map_err(|e| anyhow!(format!("Save state change set error: {:?}", e)))
+    }
+
+    pub async fn get_state_change_sets(
+        &self,
+        tx_orders: Vec<u64>,
+    ) -> Result<Vec<Option<StateChangeSetExt>>> {
+        self.reader_actor
+            .send(GetStateChangeSetsMessage { tx_orders })
+            .await?
+    }
+
+    pub async fn check_state_change_sets(&self, tx_orders: Vec<u64>) -> Result<Vec<u64>> {
+        self.reader_actor
+            .send(CheckStateChangeSetsMessage { tx_orders })
+            .await?
+    }
+
     pub async fn chain_id(&self) -> Result<ChainID> {
-        self.get_states(AccessPath::object(ChainID::chain_id_object_id()))
+        self.get_states(AccessPath::object(ChainID::chain_id_object_id()), None)
             .await?
             .into_iter()
             .next()
@@ -216,7 +306,7 @@ impl ExecutorProxy {
     }
 
     pub async fn bitcoin_network(&self) -> Result<BitcoinNetwork> {
-        self.get_states(AccessPath::object(BitcoinNetwork::object_id()))
+        self.get_states(AccessPath::object(BitcoinNetwork::object_id()), None)
             .await?
             .into_iter()
             .next()
@@ -228,7 +318,10 @@ impl ExecutorProxy {
     //TODO provide a trait to abstract the async state reader, elemiate the duplicated code bwteen RpcService and Client
     pub async fn get_sequence_number(&self, address: AccountAddress) -> Result<u64> {
         Ok(self
-            .get_states(AccessPath::object(Account::account_object_id(address)))
+            .get_states(
+                AccessPath::object(Account::account_object_id(address)),
+                None,
+            )
             .await?
             .pop()
             .flatten()

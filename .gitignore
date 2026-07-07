@@ -16,7 +16,6 @@ build/
 *.mvcov
 
 # 3rdparty configure files
-.vscode/
 .fleet/
 .idea/
 
@@ -36,3 +35,14 @@ sdk/typescript/dist/
 sdk/typescript/example/
 sdk/typescript/src/generated/
 *.out
+
+# pnpm store
+.pnpm-store/
+
+rooch-book
+sdk-examples
+
+__pycache__
+
+# Claude Code temporary files and configuration
+.claude/

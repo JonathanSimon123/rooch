@@ -5,7 +5,8 @@ module rooch_framework::transfer {
     
     use std::option;
     use std::string::String;
-    use moveos_std::object::Object;
+    use moveos_std::object::{Object, ObjectID};
+    use std::vector;
     use moveos_std::object;
     use rooch_framework::account_coin_store;
     use rooch_framework::multichain_address;
@@ -32,6 +33,7 @@ module rooch_framework::transfer {
     ) {
         let btc_address = bitcoin_address::from_string(&to);
         let rooch_address = bitcoin_address::to_rooch_address(&btc_address);
+        address_mapping::bind_bitcoin_address_internal(rooch_address, btc_address);
         account_coin_store::transfer<CoinType>(from, rooch_address, amount)
     }
 
@@ -62,6 +64,33 @@ module rooch_framework::transfer {
         obj: Object<T>) {
         let btc_address = bitcoin_address::from_string(&to);
         let rooch_address = bitcoin_address::to_rooch_address(&btc_address);
+        address_mapping::bind_bitcoin_address_internal(rooch_address, btc_address);
         object::transfer(obj, rooch_address);
+    }
+
+    /// Direct transfer by coin type name
+    public entry fun transfer_coin_by_type_name(
+        from: &signer,
+        to: address,
+        coin_type: String,
+        amount: u256,
+    ) {
+        account_coin_store::transfer_by_type_name(from, to, coin_type, amount);
+    }
+
+    /// Batch transfer `Object<T>` from `from` to `to`.
+    public entry fun transfer_object_batch<T: key + store>(
+        from: &signer,
+        to: address,
+        object_ids: vector<ObjectID>,
+    ) {
+        let idx = 0;
+        let len = vector::length(&object_ids);
+        while (idx < len) {
+            let object_id = *vector::borrow(&object_ids, idx);
+            let obj = object::take_object<T>(from, object_id);
+            object::transfer(obj, to);
+            idx = idx + 1;
+        }
     }
 }

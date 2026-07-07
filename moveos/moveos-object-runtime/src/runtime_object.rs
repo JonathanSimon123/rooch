@@ -32,6 +32,10 @@ use moveos_types::{
 };
 use std::collections::{btree_map::Entry, BTreeMap};
 
+type ScanFieldList = Vec<(FieldKey, Value)>;
+type FieldList = Vec<(FieldKey, RuntimeObject, Option<Option<NumBytes>>)>;
+type FieldKeyList = Vec<(FieldKey, Option<Option<NumBytes>>)>;
+
 /// A structure representing a single runtime object.
 pub struct RuntimeObject {
     pub(crate) rt_meta: RuntimeObjectMeta,
@@ -140,6 +144,10 @@ impl RuntimeObject {
         self.rt_meta.is_none()
     }
 
+    pub fn is_fresh(&self) -> bool {
+        self.rt_meta.is_fresh()
+    }
+
     pub fn id(&self) -> &ObjectID {
         self.rt_meta.id()
     }
@@ -206,37 +214,138 @@ impl RuntimeObject {
         field_key: FieldKey,
     ) -> PartialVMResult<(&mut RuntimeObject, Option<Option<NumBytes>>)> {
         let state_root = self.state_root()?;
-        let field_obj_id = self.id().child_id(field_key);
+        // Capture parent id now to use in error logs without borrowing self later.
+        let parent_for_log = self.id().clone();
         Ok(match self.fields.entry(field_key) {
             Entry::Vacant(entry) => {
-                let (tv, loaded) =
-                    match resolver
-                        .get_field_at(state_root, &field_key)
-                        .map_err(|err| {
-                            partial_extension_error(format!(
-                                "remote object resolver failure: {}",
-                                err
-                            ))
-                        })? {
-                        Some(obj_state) => {
-                            debug_assert!(
+                // Build field_obj_id outside to avoid borrowing self twice
+                let field_obj_id = parent_for_log.child_id(field_key);
+                let (tv, loaded) = match resolver
+                    .get_field_at(state_root, &field_key)
+                    .map_err(|err| {
+                        // Capture detailed context to help diagnose missing node / pruner issues.
+                        partial_extension_error(format!(
+                            "remote object resolver failure: {}, object_id: {}, state_root: {}, field_key: {}",
+                            err, parent_for_log, state_root, field_key
+                        ))
+                    })? {
+                    Some(obj_state) => {
+                        debug_assert!(
                             obj_state.metadata.id == field_obj_id,
                             "The loaded object id should be equal to the expected field object id"
                         );
-                            let value_layout =
-                                layout_loader.get_type_layout(obj_state.object_type())?;
-                            let state_bytes_len = obj_state.value.len() as u64;
-                            (
-                                RuntimeObject::load(value_layout, obj_state)?,
-                                Some(NumBytes::new(state_bytes_len)),
-                            )
-                        }
-                        None => (RuntimeObject::none(field_obj_id), None),
-                    };
+                        let value_layout = layout_loader.get_type_layout(obj_state.object_type())?;
+                        let state_bytes_len = obj_state.value.len() as u64;
+                        (
+                            RuntimeObject::load(value_layout, obj_state)?,
+                            Some(NumBytes::new(state_bytes_len)),
+                        )
+                    }
+                    None => (RuntimeObject::none(field_obj_id), None),
+                };
                 (entry.insert(tv), Some(loaded))
             }
             Entry::Occupied(entry) => (entry.into_mut(), None),
         })
+    }
+
+    /// Retrieves a field of the object from the state store.
+    fn retrieve_field_object_from_db(
+        &self,
+        layout_loader: &dyn TypeLayoutLoader,
+        resolver: &dyn StatelessResolver,
+        field_key: FieldKey,
+    ) -> PartialVMResult<(RuntimeObject, Option<Option<NumBytes>>)> {
+        let state_root = self.state_root()?;
+        let parent_id = self.id();
+        let field_obj_id = parent_id.child_id(field_key);
+
+        match resolver
+            .get_field_at(state_root, &field_key)
+            .map_err(|err| {
+                partial_extension_error(format!(
+                    "remote object retrieve_field failure: {}, object_id: {}, state_root: {}, field_key: {}",
+                    err, parent_id, state_root, field_key
+                ))
+            })? {
+            Some(obj_state) => {
+                debug_assert!(
+                    obj_state.metadata.id == field_obj_id,
+                    "The loaded object id should be equal to the expected field object id"
+                );
+                let value_layout = layout_loader.get_type_layout(obj_state.object_type())?;
+                let state_bytes_len = obj_state.value.len() as u64;
+
+                Ok((
+                    RuntimeObject::load(value_layout, obj_state)?,
+                    Some(Some(NumBytes::new(state_bytes_len))),
+                ))
+            }
+            None => Ok((RuntimeObject::none(field_obj_id), Some(None))),
+        }
+    }
+
+    /// List fields of the object from the state store.
+    fn list_field_objects_from_db(
+        &self,
+        layout_loader: &dyn TypeLayoutLoader,
+        resolver: &dyn StatelessResolver,
+        cursor: Option<FieldKey>,
+        limit: usize,
+    ) -> PartialVMResult<FieldList> {
+        let state_root = self.state_root()?;
+        let state_kvs = resolver
+            .list_fields_at(state_root, cursor, limit)
+            .map_err(|err| {
+                partial_extension_error(format!("remote object resolver failure: {}", err))
+            })?;
+
+        let mut fields = Vec::new();
+        for (key, obj_state) in state_kvs {
+            let field_obj_id = self.id().child_id(key);
+            debug_assert!(
+                obj_state.metadata.id == field_obj_id,
+                "The loaded object id should be equal to the expected field object id"
+            );
+            let value_layout = layout_loader.get_type_layout(obj_state.object_type())?;
+            let state_bytes_len = obj_state.value.len() as u64;
+            fields.push((
+                key,
+                RuntimeObject::load(value_layout, obj_state)?,
+                Some(Some(NumBytes::new(state_bytes_len))),
+            ));
+        }
+
+        Ok(fields)
+    }
+
+    /// List field keys of the object from the state store.
+    fn list_field_keys_from_db(
+        &self,
+        resolver: &dyn StatelessResolver,
+        cursor: Option<FieldKey>,
+        limit: usize,
+    ) -> PartialVMResult<FieldKeyList> {
+        let state_root = self.state_root()?;
+        let state_kvs = resolver
+            .list_fields_at(state_root, cursor, limit)
+            .map_err(|err| {
+                partial_extension_error(format!("remote object resolver failure: {}", err))
+            })?;
+
+        let fields = state_kvs
+            .into_iter()
+            .map(|(key, obj_state)| {
+                let field_obj_id = self.id().child_id(key);
+                debug_assert!(
+                    obj_state.metadata.id == field_obj_id,
+                    "The loaded object id should be equal to the expected field object id"
+                );
+                let state_bytes_len = obj_state.value.len() as u64;
+                (key, Some(Some(NumBytes::new(state_bytes_len))))
+            })
+            .collect::<Vec<_>>();
+        Ok(fields)
     }
 
     pub fn get_loaded_field(&self, field_key: &FieldKey) -> Option<&RuntimeObject> {
@@ -277,7 +386,7 @@ impl RuntimeObject {
                     //We need to change the Object owner to system
                     if !matches!(&value_change, Some(Op::Delete)) {
                         rt_meta.to_system_owner()?;
-                        if log::log_enabled!(log::Level::Trace) {
+                        if tracing::enabled!(tracing::Level::TRACE) {
                             tracing::trace!(
                                 object_id = tracing::field::display(&object_id),
                                 op = "embeded",
@@ -353,6 +462,12 @@ impl RuntimeObject {
                     })?;
             Ok(Some(field.value))
         }
+    }
+
+    pub fn clear_fields(&mut self) -> PartialVMResult<()> {
+        self.rt_meta.clear_fields()?;
+        self.fields.clear();
+        Ok(())
     }
 }
 
@@ -467,7 +582,7 @@ impl RuntimeObject {
         tv.move_to(value, value_type.clone(), value_layout)?;
         let object_pointer = tv.take_object(Some(&value_type))?;
         self.rt_meta.increase_size()?;
-        if log::log_enabled!(log::Level::Trace) {
+        if tracing::enabled!(tracing::Level::TRACE) {
             tracing::trace!(
                 object_id = tracing::field::display(&self.rt_meta.id()),
                 op = "add_field",
@@ -490,7 +605,7 @@ impl RuntimeObject {
         let (tv, field_load_gas) = self.load_field(layout_loader, resolver, field_key)?;
         let value = tv.move_from(Some(&expect_value_type))?;
         self.rt_meta.decrease_size()?;
-        if log::log_enabled!(log::Level::Trace) {
+        if tracing::enabled!(tracing::Level::TRACE) {
             tracing::trace!(
                 object_id = tracing::field::display(self.rt_meta.id()),
                 op = "remove_field",
@@ -513,6 +628,114 @@ impl RuntimeObject {
         let (tv, field_load_gas) = self.load_field(layout_loader, resolver, field_key)?;
         let value = tv.borrow_value(Some(&expect_value_type))?;
         Ok((value, field_load_gas))
+    }
+
+    pub fn get_field(
+        &self,
+        layout_loader: &dyn TypeLayoutLoader,
+        resolver: &dyn StatelessResolver,
+        field_key: FieldKey,
+        rt_type: &Type,
+    ) -> PartialVMResult<(Value, Option<Option<NumBytes>>)> {
+        let expect_value_type = layout_loader.type_to_type_tag(rt_type)?;
+
+        if let Some(cached_field) = self.get_loaded_field(&field_key) {
+            let value = cached_field.borrow_value(Some(&expect_value_type))?;
+            return Ok((value, Some(Some(NumBytes::zero()))));
+        }
+
+        let (tv, field_load_gas) =
+            self.retrieve_field_object_from_db(layout_loader, resolver, field_key)?;
+        let value = tv.borrow_value(Some(&expect_value_type))?;
+        Ok((value, field_load_gas))
+    }
+
+    /// Scan fields of the object from the state store.
+    pub fn scan_fields(
+        &self,
+        layout_loader: &dyn TypeLayoutLoader,
+        resolver: &dyn StatelessResolver,
+        cursor: Option<FieldKey>,
+        limit: usize,
+        field_type: &Type,
+    ) -> PartialVMResult<(ScanFieldList, Option<NumBytes>)> {
+        let expect_value_type = layout_loader.type_to_type_tag(field_type)?;
+        let fields_with_objects =
+            self.list_field_objects_from_db(layout_loader, resolver, cursor, limit)?;
+
+        let mut fields = Vec::with_capacity(fields_with_objects.len());
+        let mut total_bytes_len = NumBytes::zero();
+
+        for (key, db_obj, bytes_len_opt) in fields_with_objects {
+            let (value, bytes_len) = if let Some(cached_field) = self.get_loaded_field(&key) {
+                (
+                    cached_field.borrow_value(Some(&expect_value_type))?,
+                    Some(NumBytes::zero()),
+                )
+            } else {
+                (
+                    db_obj.borrow_value(Some(&expect_value_type))?,
+                    bytes_len_opt.flatten(),
+                )
+            };
+
+            fields.push((key, value));
+            if let Some(bytes_len) = bytes_len {
+                total_bytes_len += bytes_len;
+            }
+        }
+
+        Ok((fields, Some(total_bytes_len)))
+    }
+
+    /// List fields keys of the object from the state store.
+    pub fn list_field_keys(
+        &self,
+        resolver: &dyn StatelessResolver,
+        cursor: Option<FieldKey>,
+        limit: usize,
+    ) -> PartialVMResult<(Vec<AccountAddress>, Option<Option<NumBytes>>)> {
+        let mut total_bytes_len = NumBytes::zero();
+        // First get fields from DB
+        let mut fields_with_objects = self.list_field_keys_from_db(resolver, cursor, limit)?;
+
+        let remaining_limit = limit.saturating_sub(fields_with_objects.len());
+        // If DB results less than limit, supplement with fresh fields from cache
+        if remaining_limit > 0 {
+            let last_key = fields_with_objects.last().map(|(key, _)| *key);
+
+            let fresh_fields = self
+                .fields
+                .iter()
+                .skip_while(|(k, _)| {
+                    if let Some(last) = &last_key {
+                        *k <= last
+                    } else {
+                        false
+                    }
+                })
+                .filter_map(|(key, field)| {
+                    if field.is_fresh() {
+                        return Some((*key, Some(Some(NumBytes::zero()))));
+                    }
+                    None
+                })
+                .take(remaining_limit);
+
+            fields_with_objects.extend(fresh_fields);
+        }
+
+        let fields = fields_with_objects
+            .into_iter()
+            .map(|(key, bytes_len_opt)| {
+                if let Some(Some(bytes_len)) = bytes_len_opt {
+                    total_bytes_len += bytes_len;
+                }
+                key.into()
+            })
+            .collect::<Vec<AccountAddress>>();
+
+        Ok((fields, Some(Some(total_bytes_len))))
     }
 }
 

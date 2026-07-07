@@ -98,22 +98,20 @@ impl<T> Receiver<T> {
     /// Attempts to receive the next value for this receiver.
     /// Decrements the gauge in case of a successful `try_recv`.
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
-        self.inner.try_recv().map(|val| {
+        self.inner.try_recv().inspect(|_val| {
             self.gauge.dec();
             if let Some(total_gauge) = &self.total {
                 total_gauge.inc();
             }
-            val
         })
     }
 
     pub fn blocking_recv(&mut self) -> Option<T> {
-        self.inner.blocking_recv().map(|val| {
+        self.inner.blocking_recv().inspect(|_val| {
             self.gauge.dec();
             if let Some(total_gauge) = &self.total {
                 total_gauge.inc();
             }
-            val
         })
     }
 
@@ -193,9 +191,8 @@ impl<T> Sender<T> {
         self.inner
             .try_send(message)
             // remove this unsightly hack once https://github.com/rust-lang/rust/issues/91345 is resolved
-            .map(|val| {
+            .inspect(|_val| {
                 self.gauge.inc();
-                val
             })
     }
 
@@ -253,11 +250,9 @@ impl<T> Sender<T> {
         &self.gauge
     }
 }
-
 ////////////////////////////////
 /// Stream API Wrappers!
 ////////////////////////////////
-
 /// A wrapper around [`crate::metered_channel::Receiver`] that implements [`Stream`].
 ///
 #[derive(Debug)]
@@ -313,11 +308,9 @@ impl<T> From<Receiver<T>> for ReceiverStream<T> {
 
 // TODO: facade PollSender
 // TODO: add prom metrics reporting for gauge and migrate all existing use cases.
-
 ////////////////////////////////////////////////////////////////
 /// Constructor
 ////////////////////////////////////////////////////////////////
-
 /// Similar to `mpsc::channel`, `channel` creates a pair of `Sender` and `Receiver`
 /// Deprecated: use `monitored_mpsc::channel` instead.
 #[track_caller]

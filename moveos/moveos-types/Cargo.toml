@@ -18,7 +18,6 @@ anyhow = { workspace = true }
 bcs = { workspace = true }
 hex = { workspace = true }
 once_cell = { workspace = true }
-thiserror = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
@@ -31,11 +30,11 @@ fastcrypto = { workspace = true }
 proptest = { optional = true, workspace = true }
 proptest-derive = { optional = true, workspace = true }
 tracing = { workspace = true }
+bech32 = { workspace = true }
 
 move-core-types = { workspace = true }
 move-vm-types = { workspace = true }
 move-resource-viewer = { workspace = true }
-move-bytecode-utils = { workspace = true }
 move-binary-format = { workspace = true }
 
 smt = { workspace = true }
@@ -52,3 +51,6 @@ fuzzing = [
     "proptest",
     "proptest-derive",
 ]
+
+[package.metadata.cargo-machete]
+ignored = ["serde_bytes"]

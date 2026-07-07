@@ -1,6 +1,9 @@
 // Copyright (c) RoochNetwork
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::da_config::DAConfig;
+use crate::proposer_config::ProposerConfig;
+use crate::store_config::StoreConfig;
 use anyhow::Result;
 use clap::Parser;
 use moveos_config::{temp_dir, DataDirPath};
@@ -8,18 +11,21 @@ use once_cell::sync::Lazy;
 use rooch_types::crypto::RoochKeyPair;
 use rooch_types::genesis_config::GenesisConfig;
 use rooch_types::rooch_network::{BuiltinChainID, RoochChainID, RoochNetwork};
+use rooch_types::service_status::ServiceStatus;
+use rooch_types::service_type::ServiceType;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::create_dir_all;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::{fmt::Debug, path::Path, path::PathBuf};
 
-use crate::da_config::DAConfig;
-use crate::store_config::StoreConfig;
-
 pub mod config;
 pub mod da_config;
+pub mod proposer_config;
 pub mod server_config;
+pub mod settings;
+pub mod state_prune;
 pub mod store_config;
 
 pub const ROOCH_DIR: &str = ".rooch";
@@ -27,11 +33,22 @@ pub const ROOCH_CONFIR_DIR: &str = "rooch_config";
 pub const ROOCH_CLIENT_CONFIG: &str = "rooch.yaml";
 pub const ROOCH_KEYSTORE_FILENAME: &str = "rooch.keystore";
 
+const DEFAULT_BTC_REORG_AWARE_BLOCK_STORE_DIR: &str = "btc-reorg-aware-block-store";
+const DEFAULT_BTC_REORG_AWARE_HEIGHT: usize = 16; // much larger than bitcoin_reorg_block_count, no need to be too large
+
 pub static R_DEFAULT_BASE_DATA_DIR: Lazy<PathBuf> = Lazy::new(|| {
     dirs_next::home_dir()
         .expect("read home dir should ok")
         .join(".rooch")
 });
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MapConfigValueSource {
+    MapConfig,   // Value came from the presence of a key in the map configuration
+    Environment, // Value came from the environment
+    Default,     // Value came from a defined default value
+    None,        // Value is not present in the map configuration, environment, or default value
+}
 
 pub fn rooch_config_dir() -> Result<PathBuf, anyhow::Error> {
     get_rooch_config_dir().and_then(|dir| {
@@ -102,24 +119,26 @@ pub struct RoochOpt {
         requires = "btc-rpc-password"
     )]
     pub btc_rpc_url: Option<String>,
-
     #[serde(skip_serializing_if = "Option::is_none")]
     #[clap(long, id = "btc-rpc-username", env = "BTC_RPC_USERNAME")]
     pub btc_rpc_username: Option<String>,
-
     #[serde(skip_serializing_if = "Option::is_none")]
     #[clap(long, id = "btc-rpc-password", env = "BTC_RPC_PASSWORD")]
     pub btc_rpc_password: Option<String>,
-
     #[serde(skip_serializing_if = "Option::is_none")]
     #[clap(long, env = "BTC_END_BLOCK_HEIGHT")]
     /// The end block height of the Bitcoin chain to stop relaying from, default is none.
     pub btc_end_block_height: Option<u64>,
-
     #[serde(skip_serializing_if = "Option::is_none")]
     #[clap(long, env = "BTC_SYNC_BLOCK_INTERVAL")]
     /// The interval of sync BTC block, default is none.
     pub btc_sync_block_interval: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[clap(long)]
+    pub btc_reorg_aware_block_store_dir: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[clap(long)]
+    pub btc_reorg_aware_height: Option<usize>,
 
     /// The address of the sequencer account
     #[clap(long)]
@@ -131,9 +150,36 @@ pub struct RoochOpt {
     #[clap(long, default_value_t)]
     pub da: DAConfig,
 
+    #[clap(flatten)]
+    pub proposer: ProposerConfig,
+
+    #[clap(long, default_value_t, value_enum)]
+    pub service_status: ServiceStatus,
+
+    /// Set quota size that defines how many requests can occur
+    /// before the governor middleware starts blocking requests from an IP address and
+    /// clients have to wait until the elements of the quota are replenished.
+    ///
+    /// **The burst_size must not be zero.**
     #[clap(long)]
-    /// The data import flag. If true, may be ignore the indexer write
-    pub data_import_flag: bool,
+    pub traffic_burst_size: Option<u32>,
+
+    /// Set the interval after which one element of the quota is replenished in seconds.
+    /// It is floating point number, for example, 0.5 means 2 requests per second.
+    /// **The interval must not be zero.**
+    ///
+    /// DEPRECATED: Use --requests-per-second instead. This parameter will be removed in a future version.
+    #[clap(long)]
+    pub traffic_per_second: Option<f64>,
+
+    /// Set the number of requests allowed per second.
+    /// It is floating point number, for example, 10.0 means 10 requests per second.
+    /// **The value must not be zero.**
+    #[clap(long)]
+    pub requests_per_second: Option<f64>,
+
+    #[clap(long, default_value_t, value_enum)]
+    pub service_type: ServiceType,
 
     #[serde(skip)]
     #[clap(skip)]
@@ -164,11 +210,18 @@ impl RoochOpt {
             btc_rpc_password: None,
             btc_end_block_height: None,
             btc_sync_block_interval: None,
+            btc_reorg_aware_block_store_dir: None,
+            btc_reorg_aware_height: None,
             sequencer_account: None,
             proposer_account: None,
             da: DAConfig::default(),
-            data_import_flag: false,
+            proposer: ProposerConfig::default(),
+            service_status: ServiceStatus::default(),
+            traffic_per_second: None,
+            traffic_burst_size: None,
+            requests_per_second: None,
             base: None,
+            service_type: ServiceType::default(),
         };
         opt.init()?;
         Ok(opt)
@@ -196,6 +249,7 @@ impl RoochOpt {
             self.store.init(Arc::clone(&arc_base))?;
             self.da.init(Arc::clone(&arc_base))?;
             self.base = Some(arc_base);
+            self.init_btc_reorg_aware_block_store_dir()?;
         }
         Ok(())
     }
@@ -208,6 +262,21 @@ impl RoochOpt {
             })
     }
 
+    pub fn init_btc_reorg_aware_block_store_dir(&mut self) -> Result<()> {
+        if self.btc_reorg_aware_block_store_dir.is_none() {
+            self.btc_reorg_aware_block_store_dir = Some(
+                self.base()
+                    .data_dir()
+                    .join(DEFAULT_BTC_REORG_AWARE_BLOCK_STORE_DIR),
+            );
+        }
+        let store_dir = self.btc_reorg_aware_block_store_dir.as_ref().unwrap();
+        if !store_dir.exists() {
+            create_dir_all(store_dir.clone())?;
+        }
+        Ok(())
+    }
+
     pub fn bitcoin_relayer_config(&self) -> Option<BitcoinRelayerConfig> {
         self.btc_rpc_url.as_ref()?;
         Some(BitcoinRelayerConfig {
@@ -216,6 +285,17 @@ impl RoochOpt {
             btc_rpc_password: self.btc_rpc_password.clone().unwrap(),
             btc_end_block_height: self.btc_end_block_height,
             btc_sync_block_interval: self.btc_sync_block_interval,
+            btc_reorg_aware_block_store_dir: self
+                .btc_reorg_aware_block_store_dir
+                .clone()
+                .unwrap_or_else(|| {
+                    self.base()
+                        .data_dir()
+                        .join(DEFAULT_BTC_REORG_AWARE_BLOCK_STORE_DIR)
+                }),
+            btc_reorg_aware_height: self
+                .btc_reorg_aware_height
+                .unwrap_or(DEFAULT_BTC_REORG_AWARE_HEIGHT),
         })
     }
 
@@ -265,6 +345,49 @@ impl RoochOpt {
     pub fn da_config(&self) -> &DAConfig {
         &self.da
     }
+
+    /// Get the traffic rate limit interval in seconds, handling both deprecated and new parameters
+    /// Returns the interval in seconds between replenishing one quota element
+    pub fn get_traffic_rate_limit_interval(&self) -> Result<f64> {
+        match (self.traffic_per_second, self.requests_per_second) {
+            (Some(interval), None) => {
+                // Only deprecated parameter is used
+                eprintln!(
+                    "WARNING: --traffic-per-second is deprecated. Use --requests-per-second instead. Current value {} means {} requests per second.",
+                    interval,
+                    1.0 / interval
+                );
+                if interval.is_nan() || interval.is_infinite() {
+                    anyhow::bail!("traffic-per-second interval must be a valid finite number");
+                }
+                if interval <= 0.0 {
+                    anyhow::bail!("traffic-per-second interval must be greater than zero");
+                }
+                Ok(interval)
+            }
+            (None, Some(rps)) => {
+                // Only new parameter is used
+                if rps.is_nan() || rps.is_infinite() {
+                    anyhow::bail!("requests-per-second must be a valid finite number");
+                }
+                if rps <= 0.0 {
+                    anyhow::bail!("requests-per-second must be greater than zero");
+                }
+                Ok(1.0 / rps)
+            }
+            (Some(interval), Some(rps)) => {
+                // Both parameters are used - this is an error
+                anyhow::bail!(
+                    "Cannot specify both --traffic-per-second ({}) and --requests-per-second ({}) simultaneously. Use --requests-per-second instead.",
+                    interval, rps
+                )
+            }
+            (None, None) => {
+                // No parameters specified - caller should handle default logic
+                anyhow::bail!("No traffic rate limit parameter specified")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -279,6 +402,8 @@ pub struct BitcoinRelayerConfig {
     pub btc_rpc_password: String,
     pub btc_end_block_height: Option<u64>,
     pub btc_sync_block_interval: Option<u64>,
+    pub btc_reorg_aware_block_store_dir: PathBuf,
+    pub btc_reorg_aware_height: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -348,9 +473,278 @@ impl ServerOpt {
     }
 
     pub fn get_active_env(&self) -> String {
-        match self.active_env.clone() {
-            Some(env) => env,
-            None => RoochChainID::default().chain_name(),
+        self.active_env
+            .clone()
+            .unwrap_or_else(|| RoochChainID::default().chain_name())
+    }
+}
+
+// value order:
+// 1. config map
+// 2. env value
+// 3. default value
+pub fn retrieve_map_config_value(
+    map_config: &mut HashMap<String, String>,
+    key: &str,
+    env_var: Option<&str>,
+    default_var: Option<&str>,
+) -> MapConfigValueSource {
+    if map_config.contains_key(key) {
+        return MapConfigValueSource::MapConfig;
+    }
+
+    if let Some(env_var) = env_var {
+        if let Ok(env_var_value) = std::env::var(env_var) {
+            // env_var exists
+            map_config.insert(key.to_string(), env_var_value.clone());
+            return MapConfigValueSource::Environment;
+        }
+    }
+
+    // Use the default
+    if let Some(default_var) = default_var {
+        map_config.insert(key.to_string(), default_var.to_string());
+        return MapConfigValueSource::Default;
+    }
+    MapConfigValueSource::None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn test_get_traffic_rate_limit_interval_with_requests_per_second() {
+        // Test with requests per second
+        let mut opt = RoochOpt {
+            requests_per_second: Some(10.0),
+            ..Default::default()
+        };
+        let interval = opt.get_traffic_rate_limit_interval().unwrap();
+        assert_eq!(interval, 0.1); // 10 requests per second = 0.1 second interval
+
+        // Test with different values
+        opt.requests_per_second = Some(100.0);
+        let interval = opt.get_traffic_rate_limit_interval().unwrap();
+        assert_eq!(interval, 0.01); // 100 requests per second = 0.01 second interval
+
+        // Test with fractional values
+        opt.requests_per_second = Some(0.5);
+        let interval = opt.get_traffic_rate_limit_interval().unwrap();
+        assert_eq!(interval, 2.0); // 0.5 requests per second = 2 second interval
+    }
+
+    #[test]
+    fn test_get_traffic_rate_limit_interval_with_deprecated_traffic_per_second() {
+        let opt = RoochOpt {
+            traffic_per_second: Some(0.1),
+            ..Default::default()
+        };
+
+        // Test with deprecated traffic per second (interval)
+        let interval = opt.get_traffic_rate_limit_interval().unwrap();
+        assert_eq!(interval, 0.1); // Should return the interval directly
+    }
+
+    #[test]
+    fn test_get_traffic_rate_limit_interval_both_parameters_error() {
+        let opt = RoochOpt {
+            traffic_per_second: Some(0.1),
+            requests_per_second: Some(10.0),
+            ..Default::default()
+        };
+
+        // Test with both parameters specified - should error
+        let result = opt.get_traffic_rate_limit_interval();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Cannot specify both"));
+    }
+
+    #[test]
+    fn test_get_traffic_rate_limit_interval_no_parameters_error() {
+        let opt = RoochOpt::default();
+
+        // Test with no parameters specified - should error
+        let result = opt.get_traffic_rate_limit_interval();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No traffic rate limit parameter specified"));
+    }
+
+    #[test]
+    fn test_get_traffic_rate_limit_interval_zero_values_error() {
+        // Test with zero requests per second
+        let opt = RoochOpt {
+            requests_per_second: Some(0.0),
+            ..Default::default()
+        };
+        let result = opt.get_traffic_rate_limit_interval();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must be greater than zero"));
+
+        // Test with zero traffic per second
+        let opt = RoochOpt {
+            traffic_per_second: Some(0.0),
+            ..Default::default()
+        };
+        let result = opt.get_traffic_rate_limit_interval();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn test_get_traffic_rate_limit_interval_negative_values_error() {
+        // Test with negative requests per second
+        let opt = RoochOpt {
+            requests_per_second: Some(-10.0),
+            ..Default::default()
+        };
+        let result = opt.get_traffic_rate_limit_interval();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must be greater than zero"));
+
+        // Test with negative traffic per second
+        let opt = RoochOpt {
+            traffic_per_second: Some(-0.1),
+            ..Default::default()
+        };
+        let result = opt.get_traffic_rate_limit_interval();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn test_get_traffic_rate_limit_interval_special_float_values_error() {
+        // Test with NaN for requests per second
+        let opt = RoochOpt {
+            requests_per_second: Some(f64::NAN),
+            ..Default::default()
+        };
+        let result = opt.get_traffic_rate_limit_interval();
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("must be a valid finite number"));
+
+        // Test with infinity for requests per second
+        let opt = RoochOpt {
+            requests_per_second: Some(f64::INFINITY),
+            ..Default::default()
+        };
+        let result = opt.get_traffic_rate_limit_interval();
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("must be a valid finite number"));
+
+        // Test with negative infinity for requests per second
+        let opt = RoochOpt {
+            requests_per_second: Some(f64::NEG_INFINITY),
+            ..Default::default()
+        };
+        let result = opt.get_traffic_rate_limit_interval();
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("must be a valid finite number"));
+
+        // Test with NaN for traffic per second
+        let opt = RoochOpt {
+            traffic_per_second: Some(f64::NAN),
+            ..Default::default()
+        };
+        let result = opt.get_traffic_rate_limit_interval();
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("must be a valid finite number"));
+
+        // Test with infinity for traffic per second
+        let opt = RoochOpt {
+            traffic_per_second: Some(f64::INFINITY),
+            ..Default::default()
+        };
+        let result = opt.get_traffic_rate_limit_interval();
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("must be a valid finite number"));
+    }
+
+    mod retrieve_map_config_value_tests {
+        use super::*;
+        use std::time;
+
+        #[test]
+        fn returns_map_config_when_key_exists() {
+            let mut map_config = HashMap::new();
+            map_config.insert("key1".to_string(), "value1".to_string());
+
+            assert_eq!(
+                retrieve_map_config_value(&mut map_config, "key1", None, Some("default")),
+                MapConfigValueSource::MapConfig
+            );
+        }
+
+        #[test]
+        fn returns_default_when_key_does_not_exist_and_no_env_var() {
+            let mut map_config = HashMap::new();
+
+            assert_eq!(
+                retrieve_map_config_value(&mut map_config, "key2", None, Some("default")),
+                MapConfigValueSource::Default
+            );
+            assert_eq!(map_config.get("key2").unwrap(), "default");
+        }
+
+        #[test]
+        fn returns_environment_when_env_var_exists() {
+            let mut map_config = HashMap::new();
+
+            // make a random env key
+            let env_key = format!(
+                "TEST_ENV_VAR_{}",
+                time::SystemTime::now().elapsed().unwrap().as_secs()
+            );
+
+            env::set_var(env_key.clone(), "env_value");
+
+            assert_eq!(
+                retrieve_map_config_value(
+                    &mut map_config,
+                    "key2",
+                    Some(&env_key.clone()),
+                    Some("default")
+                ),
+                MapConfigValueSource::Environment
+            );
+            assert_eq!(map_config.get("key2").unwrap(), "env_value");
+
+            env::remove_var(env_key);
+        }
+
+        #[test]
+        fn returns_none_when_neither_key_nor_env_var_nor_default_exists() {
+            let mut map_config = HashMap::new();
+            assert_eq!(
+                retrieve_map_config_value(&mut map_config, "key3", None, None),
+                MapConfigValueSource::None
+            );
         }
     }
 }
+
+// pub use prune_config::PruneConfig;

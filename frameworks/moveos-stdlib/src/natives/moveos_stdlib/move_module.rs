@@ -7,7 +7,7 @@ use itertools::zip_eq;
 use move_binary_format::{
     compatibility::Compatibility,
     errors::{PartialVMError, PartialVMResult},
-    normalized, CompiledModule,
+    CompiledModule,
 };
 use move_core_types::u256::U256;
 use move_core_types::{
@@ -27,12 +27,14 @@ use move_vm_types::{
     values::{Struct, Value, Vector, VectorRef},
 };
 use moveos_compiler::dependency_order::sort_by_dependency_order;
+use moveos_object_runtime::runtime::ObjectRuntimeContext;
 use moveos_types::moveos_std::move_module::MoveModuleId;
+use moveos_types::moveos_std::onchain_features::COMPATIBILITY_CHECKER_V2;
+use moveos_verifier::verifier::check_metadata_compatibility;
 use smallvec::smallvec;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::hash::Hash;
 use std::str::FromStr;
-
 // ========================================================================================
 
 const E_ADDRESS_NOT_MATCH_WITH_SIGNER: u64 = 1;
@@ -161,16 +163,6 @@ fn native_sort_and_verify_modules_inner(
         })
         .collect();
 
-    // move verifier
-    context
-        .verify_module_bundle_for_publication(&compiled_modules)
-        .map_err(|e| {
-            let modules = compiled_modules
-                .iter()
-                .map(|m| m.self_id().short_str_lossless())
-                .collect::<Vec<_>>();
-            e.append_message_with_separator('|', format!("modules: {:?}", modules))
-        })?;
     // moveos verifier
     let module_context = context.extensions_mut().get_mut::<NativeModuleContext>();
     let mut module_names = vec![];
@@ -181,9 +173,27 @@ fn native_sort_and_verify_modules_inner(
     match verify_result {
         Ok(_) => {}
         Err(e) => {
-            log::info!("modules verification error: {:?}", e);
+            tracing::info!("modules verification error: {:?}", e);
             let error_code = e.sub_status().unwrap_or(E_MODULE_VERIFICATION_ERROR);
             return Ok(NativeResult::err(cost, error_code));
+        }
+    }
+
+    // move verifier
+    let verify_result = context
+        .verify_module_bundle_for_publication(&compiled_modules)
+        .map_err(|e| {
+            let modules = compiled_modules
+                .iter()
+                .map(|m| m.self_id().short_str_lossless())
+                .collect::<Vec<_>>();
+            e.append_message_with_separator('|', format!("modules: {:?}", modules))
+        });
+    match verify_result {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::info!("modules verification error: {:?}", e);
+            return Ok(NativeResult::err(cost, E_MODULE_VERIFICATION_ERROR));
         }
     }
 
@@ -203,7 +213,7 @@ fn native_sort_and_verify_modules_inner(
             }
             Err(e) => {
                 //TODO provide a flag to control whether to print debug log.
-                log::info!("module {} verification error: {:?}", module.self_id(), e);
+                tracing::info!("module {} verification error: {:?}", module.self_id(), e);
                 return Ok(NativeResult::err(cost, E_MODULE_VERIFICATION_ERROR));
             }
         }
@@ -283,14 +293,23 @@ pub struct CheckCompatibilityInnerGasParameters {
 
 fn check_compatibililty_inner(
     gas_params: &CheckCompatibilityInnerGasParameters,
-    _context: &mut NativeContext,
+    context: &mut NativeContext,
     _ty_args: Vec<Type>,
     mut args: VecDeque<Value>,
 ) -> PartialVMResult<NativeResult> {
     let mut cost = gas_params.base;
+
+    let object_runtime_ctx = context.extensions().get::<ObjectRuntimeContext>();
+    let feature_store_opt = object_runtime_ctx.feature_store();
+    let check_friend_linking = if let Some(feature_store) = feature_store_opt {
+        feature_store.contains_feature(COMPATIBILITY_CHECKER_V2)
+    } else {
+        false
+    };
+
     // TODO: config compatibility through global configuration
     // We allow `friend` function to be broken
-    let compat = Compatibility::new(true, true, false);
+    let compat = Compatibility::new(true, true, check_friend_linking, true);
     if compat.need_check_compat() {
         let old_bytecodes = pop_arg!(args, Vec<u8>);
         let new_bytecodes = pop_arg!(args, Vec<u8>);
@@ -298,12 +317,18 @@ fn check_compatibililty_inner(
         cost += gas_params.per_byte * NumBytes::new(old_bytecodes.len() as u64);
         let new_module = CompiledModule::deserialize(&new_bytecodes)?;
         let old_module = CompiledModule::deserialize(&old_bytecodes)?;
-        let new_m = normalized::Module::new(&new_module);
-        let old_m = normalized::Module::new(&old_module);
 
-        match compat.check(&old_m, &new_m) {
+        match compat.check(&old_module, &new_module) {
             Ok(_) => {}
             Err(_) => return Ok(NativeResult::err(cost, E_MODULE_INCOMPATIBLE)),
+        }
+
+        match check_metadata_compatibility(&old_module, &new_module) {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::info!("module compatibility checking failed {:?}", e);
+                return Ok(NativeResult::err(cost, e.sub_status().unwrap_or(0)));
+            }
         }
     }
     Ok(NativeResult::ok(cost, smallvec![]))

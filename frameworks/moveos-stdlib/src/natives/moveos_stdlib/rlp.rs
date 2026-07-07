@@ -1,7 +1,7 @@
 // Copyright (c) RoochNetwork
 // SPDX-License-Identifier: Apache-2.0
 
-use log::info;
+use crate::natives::helpers;
 use move_binary_format::errors::{PartialVMError, PartialVMResult};
 use move_core_types::account_address::AccountAddress;
 use move_core_types::gas_algebra::{InternalGas, InternalGasPerByte, NumBytes};
@@ -20,6 +20,7 @@ use primitive_types::U256 as PrimitiveU256;
 use rlp::{self, Rlp, RlpStream};
 use smallvec::smallvec;
 use std::{collections::VecDeque, sync::Arc};
+use tracing::info;
 
 use crate::natives::helpers::make_module_natives;
 
@@ -290,8 +291,14 @@ impl GasParameters {
 
 pub fn make_all(gas_params: GasParameters) -> impl Iterator<Item = (String, NativeFunction)> {
     let natives = [
-        ("to_bytes", make_native_to_bytes(gas_params.to_bytes)),
-        ("from_bytes", make_native_from_bytes(gas_params.from_bytes)),
+        (
+            "to_bytes",
+            helpers::make_native(gas_params.to_bytes, native_to_bytes),
+        ),
+        (
+            "from_bytes",
+            helpers::make_native(gas_params.from_bytes, native_from_bytes),
+        ),
     ];
 
     make_module_natives(natives)

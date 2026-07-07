@@ -1,9 +1,10 @@
 // Copyright (c) RoochNetwork
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::address::RoochAddress;
-use crate::transaction::{LedgerTransaction, LedgerTxData};
+use crate::indexer::Filter;
+use crate::transaction::{LedgerTransaction, LedgerTxData, TransactionWithInfo};
 use anyhow::Result;
+use move_core_types::account_address::AccountAddress;
 use moveos_types::h256::H256;
 use moveos_types::moveos_std::tx_context::TxContext;
 use moveos_types::transaction::{MoveAction, TransactionExecutionInfo};
@@ -18,19 +19,13 @@ pub struct IndexerTransaction {
 
     pub sequence_number: u64,
     // the account address of sender who send the transaction
-    pub sender: RoochAddress,
+    pub sender: AccountAddress,
     pub action_type: u8,
     pub auth_validator_id: u64,
-    pub authenticator_payload: Vec<u8>,
-    pub tx_accumulator_root: H256,
-    pub state_root: H256,
-    pub size: u64,
-    pub event_root: H256,
     // the amount of gas used.
     pub gas_used: u64,
     // the vm status.
     pub status: String,
-
     pub created_at: u64,
 }
 
@@ -42,7 +37,7 @@ impl IndexerTransaction {
         tx_context: TxContext,
     ) -> Result<Self> {
         let status = serde_json::to_string(&execution_info.status)?;
-        let (auth_validator_id, authenticator_payload) = match &transaction.data {
+        let (auth_validator_id, _authenticator_payload) = match &transaction.data {
             LedgerTxData::L1Block(_block) => (0, vec![]),
             LedgerTxData::L1Tx(_tx) => (0, vec![]),
             LedgerTxData::L2Tx(tx) => (
@@ -58,19 +53,13 @@ impl IndexerTransaction {
 
             sequence_number: tx_context.sequence_number,
             // the account address of sender who send the transaction
-            sender: tx_context.sender.into(),
+            sender: tx_context.sender,
             action_type: move_action.action_type(),
             auth_validator_id,
-            authenticator_payload,
-            tx_accumulator_root: transaction.sequence_info.tx_accumulator_root,
-            state_root: execution_info.state_root,
-            size: execution_info.size,
-            event_root: execution_info.event_root,
             // the amount of gas used.
             gas_used: execution_info.gas_used,
             // the vm status.
             status,
-
             created_at: transaction.sequence_info.tx_timestamp,
         };
         Ok(indexer_transaction)
@@ -81,9 +70,7 @@ impl IndexerTransaction {
 #[serde(rename_all = "camelCase")]
 pub enum TransactionFilter {
     /// Query by sender address.
-    Sender(RoochAddress),
-    /// Query by multi chain original address.
-    OriginalAddress(String),
+    Sender(AccountAddress),
     /// Query by the transaction hash list.
     TxHashes(Vec<H256>),
     /// Return transactions in [start_time, end_time) interval
@@ -100,4 +87,47 @@ pub enum TransactionFilter {
         /// right endpoint of transaction order, exclusive
         to_order: u64,
     },
+    All,
+}
+
+impl TransactionFilter {
+    fn try_matches(&self, item: &TransactionWithInfo) -> Result<bool> {
+        Ok(match self {
+            TransactionFilter::Sender(sender) => {
+                if let Some(tx_sender) = item.transaction.sender() {
+                    sender == &AccountAddress::from(tx_sender)
+                } else {
+                    false
+                }
+            }
+            TransactionFilter::TxHashes(tx_hash) => {
+                if let Some(execution_info) = item.execution_info.clone() {
+                    tx_hash.contains(&execution_info.tx_hash)
+                } else {
+                    false
+                }
+            }
+            TransactionFilter::TimeRange {
+                start_time,
+                end_time,
+            } => {
+                *start_time <= item.transaction.sequence_info.tx_timestamp
+                    && item.transaction.sequence_info.tx_timestamp < *end_time
+            }
+            TransactionFilter::TxOrderRange {
+                from_order,
+                to_order,
+            } => {
+                *from_order <= item.transaction.sequence_info.tx_order
+                    && item.transaction.sequence_info.tx_order < *to_order
+            }
+            TransactionFilter::All => true,
+        })
+    }
+}
+
+impl Filter<TransactionWithInfo> for TransactionFilter {
+    fn matches(&self, item: &TransactionWithInfo) -> bool {
+        self.try_matches(item).unwrap_or_default()
+    }
 }

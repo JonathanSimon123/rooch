@@ -2,35 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::jsonrpc_types::{
-    AnnotatedMoveStructView, H256View, RoochAddressView, RoochOrBitcoinAddressView, StrView,
-    StructTagView,
+    AnnotatedMoveStructView, H256View, HumanReadableDisplay, ObjectIDView, RoochAddressView,
+    StrView, StructTagView, UnitedAddressView,
 };
 use moveos_types::moveos_std::{
-    event::{AnnotatedEvent, Event, EventID, TransactionEvent},
+    event::{AnnotatedEvent, Event, EventID},
     object::ObjectID,
 };
-use rooch_types::indexer::event::{EventFilter, IndexerEvent, IndexerEventID};
+use rooch_types::address::RoochAddress;
+use rooch_types::indexer::event::{
+    AnnotatedIndexerEvent, EventFilter, IndexerEvent, IndexerEventID,
+};
+use rooch_types::indexer::Filter;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct TransactionEventView {
-    pub event_type: StructTagView,
-    pub event_data: StrView<Vec<u8>>,
-    pub event_index: StrView<u64>,
-    pub decoded_event_data: Option<AnnotatedMoveStructView>,
-}
-
-impl From<TransactionEvent> for TransactionEventView {
-    fn from(event: TransactionEvent) -> Self {
-        TransactionEventView {
-            event_type: event.event_type.into(),
-            event_data: StrView(event.event_data),
-            event_index: event.event_index.into(),
-            decoded_event_data: None,
-        }
-    }
-}
 
 #[derive(
     Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
@@ -60,13 +45,13 @@ impl From<EventIDView> for EventID {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EventView {
     pub event_id: EventIDView,
     pub event_type: StructTagView,
     pub event_data: StrView<Vec<u8>>,
     pub event_index: StrView<u64>,
-    pub decoded_event_data: Option<AnnotatedMoveStructView>,
+    pub decoded_event_data: Option<serde_json::Value>,
 }
 
 impl From<Event> for EventView {
@@ -99,8 +84,22 @@ impl From<AnnotatedEvent> for EventView {
             event_type: event.event.event_type.into(),
             event_data: StrView(event.event.event_data),
             event_index: event.event.event_index.into(),
-            decoded_event_data: Some(event.decoded_event_data.into()),
+            decoded_event_data: Some(
+                AnnotatedMoveStructView::from(event.decoded_event_data).into(),
+            ),
         }
+    }
+}
+
+impl HumanReadableDisplay for EventView {
+    fn to_human_readable_string(&self, _verbose: bool, indent: usize) -> String {
+        format!(
+            "{indent}event handle id: {}\n{indent}event seq      : {}\n{indent}event type     : {}",
+            self.event_id.event_handle_id,
+            self.event_id.event_seq.0,
+            self.event_type,
+            indent = " ".repeat(indent),
+        )
     }
 }
 
@@ -130,7 +129,7 @@ impl From<IndexerEventIDView> for IndexerEventID {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IndexerEventView {
     pub indexer_event_id: IndexerEventIDView,
     pub event_id: EventIDView,
@@ -139,7 +138,7 @@ pub struct IndexerEventView {
     pub tx_hash: H256View,
     pub sender: RoochAddressView,
     pub created_at: StrView<u64>,
-    pub decoded_event_data: Option<AnnotatedMoveStructView>,
+    pub decoded_event_data: Option<serde_json::Value>,
 }
 
 impl From<IndexerEvent> for IndexerEventView {
@@ -148,9 +147,9 @@ impl From<IndexerEvent> for IndexerEventView {
             indexer_event_id: event.indexer_event_id.into(),
             event_id: event.event_id.into(),
             event_type: event.event_type.into(),
-            event_data: StrView(event.event_data),
+            event_data: StrView(event.event_data.unwrap_or_default()),
             tx_hash: event.tx_hash.into(),
-            sender: event.sender.into(),
+            sender: RoochAddress::from(event.sender).into(),
             created_at: event.created_at.into(),
 
             decoded_event_data: None,
@@ -158,13 +157,56 @@ impl From<IndexerEvent> for IndexerEventView {
     }
 }
 
+impl From<IndexerEventView> for IndexerEvent {
+    fn from(event: IndexerEventView) -> Self {
+        IndexerEvent {
+            indexer_event_id: event.indexer_event_id.into(),
+            event_id: event.event_id.into(),
+            event_type: event.event_type.into(),
+            event_data: Some(event.event_data.0),
+            tx_hash: event.tx_hash.into(),
+            sender: RoochAddress::from(event.sender).into(),
+            created_at: event.created_at.into(),
+        }
+    }
+}
+
+impl From<AnnotatedIndexerEvent> for IndexerEventView {
+    fn from(event: AnnotatedIndexerEvent) -> Self {
+        IndexerEventView {
+            indexer_event_id: event.event.indexer_event_id.into(),
+            event_id: event.event.event_id.into(),
+            event_type: event.event.event_type.into(),
+            event_data: StrView(event.event.event_data.unwrap_or_default()),
+            tx_hash: event.event.tx_hash.into(),
+            sender: RoochAddress::from(event.event.sender).into(),
+            created_at: event.event.created_at.into(),
+            decoded_event_data: Some(
+                AnnotatedMoveStructView::from(event.decoded_event_data).into(),
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EventFilterView {
+    /// Query by event type with sender
+    EventTypeWithSender {
+        event_type: StructTagView,
+        sender: UnitedAddressView,
+    },
     /// Query by event type.
     EventType(StructTagView),
+    /// Query by event handle id with sender
+    EventHandleWithSender {
+        event_handle_id: ObjectIDView,
+        sender: UnitedAddressView,
+    },
+    /// Query by event handle id.
+    EventHandle(ObjectIDView),
     /// Query by sender address.
-    Sender(RoochOrBitcoinAddressView),
+    Sender(UnitedAddressView),
     /// Return events emitted by the given transaction hash.
     TxHash(H256View),
     /// Return events emitted in [start_time, end_time) interval
@@ -182,13 +224,28 @@ pub enum EventFilterView {
         /// right endpoint of transaction order, exclusive
         to_order: StrView<u64>,
     },
+    All,
 }
 
 impl From<EventFilterView> for EventFilter {
     fn from(event_filter: EventFilterView) -> Self {
         match event_filter {
+            EventFilterView::EventTypeWithSender { event_type, sender } => {
+                Self::EventTypeWithSender {
+                    event_type: event_type.into(),
+                    sender: sender.0.rooch_address.into(),
+                }
+            }
             EventFilterView::EventType(event_type) => Self::EventType(event_type.into()),
-            EventFilterView::Sender(address) => Self::Sender(address.into()),
+            EventFilterView::EventHandleWithSender {
+                event_handle_id,
+                sender,
+            } => Self::EventHandleWithSender {
+                event_handle_id: event_handle_id.0,
+                sender: sender.0.rooch_address.into(),
+            },
+            EventFilterView::EventHandle(event_handle_id) => Self::EventHandle(event_handle_id.0),
+            EventFilterView::Sender(address) => Self::Sender(address.0.rooch_address.into()),
             EventFilterView::TxHash(tx_hash) => Self::TxHash(tx_hash.into()),
             EventFilterView::TimeRange {
                 start_time,
@@ -204,6 +261,21 @@ impl From<EventFilterView> for EventFilter {
                 from_order: from_order.0,
                 to_order: to_order.0,
             },
+            EventFilterView::All => Self::All,
         }
+    }
+}
+
+impl EventFilterView {
+    fn try_matches(&self, item_view: &IndexerEventView) -> anyhow::Result<bool> {
+        let filter: EventFilter = self.clone().into();
+        let item: IndexerEvent = item_view.clone().into();
+        Ok(filter.matches(&item))
+    }
+}
+
+impl Filter<IndexerEventView> for EventFilterView {
+    fn matches(&self, item: &IndexerEventView) -> bool {
+        self.try_matches(item).unwrap_or_default()
     }
 }

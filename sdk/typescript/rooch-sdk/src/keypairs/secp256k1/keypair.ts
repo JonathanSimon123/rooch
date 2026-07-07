@@ -2,14 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { HDKey } from '@scure/bip32'
-
+import { generateMnemonic } from '@scure/bip39'
+import { wordlist } from '@scure/bip39/wordlists/english'
 import { schnorr, secp256k1 } from '@noble/curves/secp256k1'
-import { BitcoinAddress, RoochAddress } from '../../address/index.js'
+import { BitcoinAddress, BitcoinNetowkType, RoochAddress } from '../../address/index.js'
 import {
   Authenticator,
   BitcoinSignMessage,
   encodeRoochSercetKey,
-  isValidBIP32Path,
+  isValidBIP86Path,
   Keypair,
   mnemonicToSeed,
   decodeRoochSercetKey,
@@ -20,7 +21,7 @@ import { blake2b, sha256, toHEX } from '../../utils/index.js'
 import { Secp256k1PublicKey } from './publickey.js'
 import { Transaction } from '../../transactions/index.js'
 
-export const DEFAULT_SECP256K1_DERIVATION_PATH = "m/54'/784'/0'/0/0"
+export const DEFAULT_SECP256K1_DERIVATION_PATH = "m/86'/0'/0'/0/1"
 
 /**
  * Secp256k1 Keypair data
@@ -55,11 +56,15 @@ export class Secp256k1Keypair extends Keypair {
   }
 
   getBitcoinAddress(): BitcoinAddress {
-    return this.getSchnorrPublicKey().toAddress()
+    return this.getSchnorrPublicKey().toAddress().bitcoinAddress
+  }
+
+  getBitcoinAddressWith(network: BitcoinNetowkType): BitcoinAddress {
+    return this.getSchnorrPublicKey().toAddressWith(network).bitcoinAddress
   }
 
   getRoochAddress(): RoochAddress {
-    return this.getSchnorrPublicKey().toAddress().genRoochAddress()
+    return this.getSchnorrPublicKey().toAddress().roochAddress
   }
 
   /**
@@ -88,7 +93,6 @@ export class Secp256k1Keypair extends Keypair {
    * @param secretKey secret key byte array
    * @param skipValidation skip secret key validation
    */
-
   static fromSecretKey(secretKey: Uint8Array | string, skipValidation?: boolean): Secp256k1Keypair {
     const decodeSecretKey =
       typeof secretKey === 'string'
@@ -143,7 +147,7 @@ export class Secp256k1Keypair extends Keypair {
   }
 
   /**
-   * Return the signature for the provided data.
+   * Return the ecdsa signature for the provided data.
    */
   async sign(input: Bytes) {
     const msgHash = sha256(input)
@@ -152,6 +156,15 @@ export class Secp256k1Keypair extends Keypair {
     })
 
     return sig.toCompactRawBytes()
+  }
+
+  /**
+   * Return the schnorr signature for the provided data.
+   */
+  async sign_schnorr(input: Bytes, auxRand?: Bytes) {
+    const sig = schnorr.sign(input, this.keypair.secretKey, auxRand)
+
+    return sig
   }
 
   async signTransaction(input: Transaction): Promise<Authenticator> {
@@ -165,23 +178,36 @@ export class Secp256k1Keypair extends Keypair {
    * Derive Secp256k1 keypair from mnemonics and path. The mnemonics must be normalized
    * and validated against the english wordlist.
    *
-   * If path is none, it will default to m/54'/784'/0'/0/0, otherwise the path must
-   * be compliant to BIP-32 in form m/54'/784'/{account_index}'/{change_index}/{address_index}.
+   * If path is none, it will default to m/86'/0'/0'/0/1, otherwise the path must
+   * be compliant to BIP-32 in form m/86'/0'/{account_index}'/{change_index}/{address_index}.
    */
   static deriveKeypair(mnemonics: string, path?: string): Secp256k1Keypair {
     if (path == null) {
       path = DEFAULT_SECP256K1_DERIVATION_PATH
     }
-    if (!isValidBIP32Path(path)) {
+    if (!isValidBIP86Path(path)) {
       throw new Error('Invalid derivation path')
     }
     const key = HDKey.fromMasterSeed(mnemonicToSeed(mnemonics)).derive(path)
+
     if (key.publicKey == null || key.privateKey == null) {
       throw new Error('Invalid key')
     }
-    return new Secp256k1Keypair({
-      publicKey: key.publicKey,
-      secretKey: key.privateKey,
-    })
+    return Secp256k1Keypair.fromSecretKey(key.privateKey)
+  }
+
+  /**
+   * Generate a new mnemonic and derive a keypair from it.
+   *
+   * @param path Optional derivation path. If not provided, will use DEFAULT_SECP256K1_DERIVATION_PATH
+   * @returns An object containing the mnemonic and the derived keypair
+   */
+  static generateWithMnemonic(path?: string): {
+    mnemonic: string
+    keypair: Secp256k1Keypair
+  } {
+    const mnemonic = generateMnemonic(wordlist)
+    const keypair = this.deriveKeypair(mnemonic, path)
+    return { mnemonic, keypair }
   }
 }

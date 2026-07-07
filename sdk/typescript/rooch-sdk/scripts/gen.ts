@@ -17,6 +17,20 @@ import type {
 } from './open-rpc'
 
 const packageRoot = path.resolve(import.meta.url.slice(5), '../..')
+
+// Clean up the generated directory before generating new files
+const generatedDir = path.resolve(packageRoot, './src/generated')
+try {
+  await fs.rm(generatedDir, { recursive: true, force: true })
+  console.log('Cleaned up existing generated directory')
+} catch (error) {
+  // Directory might not exist, which is fine
+  console.log(
+    'Generated directory did not exist or could not be removed:',
+    error instanceof Error ? error.message : String(error),
+  )
+}
+
 const openRpcSpec: OpenRpcSpec = JSON.parse(
   await fs.readFile(
     path.resolve(packageRoot, '../../../crates/rooch-open-rpc-spec/schemas/openrpc.json'),
@@ -44,6 +58,7 @@ const options: {
       typeAlias?: string
       alias?: string
       flatten?: boolean
+      create?: Record<string, ts.TypeNode>
     }
   >
   methods: Record<
@@ -60,7 +75,13 @@ const options: {
     }
   >
 } = {
-  types: {},
+  types: {
+    BalanceInfoView: {
+      create: {
+        fixedBalance: ts.factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
+      },
+    },
+  },
   methods: {
     // rooch_executeViewFunction: {
     //   params:{
@@ -68,10 +89,19 @@ const options: {
     //   },
     //   flattenParams: ['function_call']
     // },
+    rooch_getObjectStates: {
+      params: {
+        object_ids: {
+          alias: 'ids',
+          typeAlias: 'string[]',
+        },
+      },
+    },
     rooch_getBalance: {
       params: {
         account_addr: {
           alias: 'owner',
+          typeAlias: 'address',
         },
       },
     },
@@ -79,6 +109,7 @@ const options: {
       params: {
         account_addr: {
           alias: 'owner',
+          typeAlias: 'address',
         },
       },
     },
@@ -169,7 +200,11 @@ fileGenerator.statements.push(
             normalizeName(name),
             undefined,
             undefined,
-            await createObjectMembers(schema as Extract<OpenRpcType, { type: 'object' }>),
+            await createObjectMembers(
+              schema as Extract<OpenRpcType, { type: 'object' }>,
+              undefined,
+              name,
+            ),
           ),
         )
       }),
@@ -192,6 +227,17 @@ methodGenerator.imports.push(
       ts.factory.createNamespaceImport(ts.factory.createIdentifier('RpcTypes')),
     ),
     ts.factory.createStringLiteral('./generated.js'),
+  ),
+  ts.factory.createImportDeclaration(
+    undefined,
+    ts.factory.createImportClause(
+      true,
+      undefined,
+      ts.factory.createNamedImports([
+        ts.factory.createImportSpecifier(false, undefined, ts.factory.createIdentifier('address')),
+      ]),
+    ),
+    ts.factory.createStringLiteral('../../types/index.js'),
   ),
 )
 
@@ -273,6 +319,7 @@ async function createMethodParam(method: OpenRpcMethod, param: OpenRpcParam) {
 async function createObjectMembers(
   type: Extract<OpenRpcTypeRef, { type: 'object' }>,
   namespace?: string,
+  typeName?: string,
 ) {
   const members: ts.TypeElement[] = []
 
@@ -327,6 +374,13 @@ async function createObjectMembers(
       }),
     )),
   )
+
+  if (typeName && options.types[typeName]?.create) {
+    const additionalFields = options.types[typeName].create
+    for (const [fieldName, fieldType] of Object.entries(additionalFields)) {
+      members.push(ts.factory.createPropertySignature(undefined, fieldName, undefined, fieldType))
+    }
+  }
 
   return members
 }

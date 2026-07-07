@@ -12,85 +12,110 @@ npm i @roochnetwork/rooch-sdk
 
 ## Connecting to Rooch Network
 
-The JsonRpcProvider class provides a connection to the JSON-RPC Server and should be used for all read-only operations. The default URLs to connect with the RPC server are:
+The SDK supports both HTTP and WebSocket connections. You can choose the appropriate transport based on your needs:
 
-- local: http://127.0.0.1:500051
-- DevNet: https://dev-seed.rooch.network::443
-
-For local development, you can run cargo run server start to start a local network. Refer to this guide for more information.
+### HTTP Connection (Default)
 
 ```typescript
-import { JsonRpcProvider, DevChain } from '@roochnetwork/rooch-sdk'
+import { RoochClient, getRoochNodeUrl } from '@roochnetwork/rooch-sdk'
 
-// create a provider connected to devnet
-const provider = new JsonRpcProvider(DevChain)
-
-// get transactions
-await provider.getTransactionsByOrder(0, 10)
-```
-
-You can also construct your own in custom connections, with the URL for your own network
-
-```typescript
-import { JsonRpcProvider, Chain } from '@roochnetwork/rooch-sdk'
-
-// Definition custom chian
-export const CustomChain = new Chain(CUSTOM_CHAIN_ID, 'CUSTOM_CHAIN_NAME', {
-  url: CUSTOM_CHAIN_URL,
+// create a client connected to testnet
+const client = new RoochClient({
+  url: getRoochNodeUrl('testnet'),
 })
 
-const provider = new JsonRpcProvider(CustomChain)
-
-// get transactions
-await provider.getTransactionsByOrder(0, 10)
+// get balances
+await client.getBalances({
+  owner: '',
+})
 ```
 
-## Writing APIs
-
-Rooch Account
+### WebSocket Connection
 
 ```typescript
-import { JsonRpcProvider, DevChain, Account, Ed25519Keypair } from '@roochnetwork/rooch-sdk'
-const provider = new JsonRpcProvider(DevChain)
-const pk = Ed25519Keypair.generate()
-const authorizer = new PrivateKeyAuth(pk)
+import { RoochClient, RoochWebSocketTransport, getRoochNodeUrl } from '@roochnetwork/rooch-sdk'
 
-const keypairAccount = Account(provider, account.roochAddress, authorizer)
+// Create WebSocket transport with custom options
+const wsTransport = new RoochWebSocketTransport({
+  url: getRoochNodeUrl('testnet'),
+  reconnectDelay: 1000, // Delay between reconnection attempts (default: 1000ms)
+  maxReconnectAttempts: 5, // Maximum number of reconnection attempts (default: 5)
+  requestTimeout: 30000, // Request timeout (default: 30000ms)
+  connectionReadyTimeout: 5000, // Connection ready timeout (default: 5000ms)
+})
+
+// Create client with WebSocket transport
+const client = new RoochClient({
+  transport: wsTransport,
+})
+
+// Use client as normal
+await client.getBalances({
+  owner: '',
+})
+
+// Clean up resources when done
+client.destroy()
 ```
+
+The WebSocket transport provides additional features:
+
+- Automatic reconnection on connection loss
+- Configurable timeouts and retry attempts
+- Connection state management
+- Resource cleanup
+
+You can customize the WebSocket behavior through the following options:
+
+- `url`: WebSocket endpoint URL (required)
+- `reconnectDelay`: Delay between reconnection attempts in milliseconds
+- `maxReconnectAttempts`: Maximum number of reconnection attempts
+- `requestTimeout`: Timeout for individual requests
+- `connectionReadyTimeout`: Timeout for waiting for connection to be ready
+- `protocols`: WebSocket sub-protocols (optional)
+
+## Writing APIs
 
 Session Account
 
 ```typescript
-import { JsonRpcProvider, DevChain, Account, Ed25519Keypair } from '@roochnetwork/rooch-sdk'
-const provider = new JsonRpcProvider(DevChain)
-const pk = Ed25519Keypair.generate()
-const authorizer = new PrivateKeyAuth(pk)
+import { RoochClient, Secp256k1Keypair, getRoochNodeUrl } from '@roochnetwork/rooch-sdk'
 
-const sessionAccount = new Account(provider, account.roochAddress, authorizer).createSessionAccount(
-  scope,
-  maxInactiveInterval,
-  opts,
-)
+const client = new RoochClient({
+  url: getRoochNodeUrl('testnet'),
+})
+
+const kp = Secp256k1Keypair.generate()
+
+const session = await client.createSession({
+  sessionArgs: {
+    appName: 'your app name',
+    appUrl: 'your app url',
+    scopes: ['0x3::empty::empty_with_signer'],
+  },
+  signer: kp,
+})
 ```
 
 ### Move Call
 
 ```typescript
-import { JsonRpcProvider, DevChain, Account, Ed25519Keypair } from '@roochnetwork/rooch-sdk'
-const provider = new JsonRpcProvider(DevChain)
-const pk = Ed25519Keypair.generate()
-const authorizer = new PrivateKeyAuth(pk)
+import { RoochClient, getRoochNodeUrl, Transaction } from '@roochnetwork/rooch-sdk'
 
-const keypairAccount = Account(provider, account.roochAddress, authorizer)
+const client = new RoochClient({
+  url: getRoochNodeUrl('testnet'),
+})
 
-const result = keypairAccount.runFunction(
-  '0x49ee3cf17a017b331ab2b8a4d40ecc9706f328562f9db63cba625a9c106cdf35::counter::increase',
-  [],
-  [],
-  {
-    maxGasAmount: 100000000,
-  },
-)
+const tx = new Transaction()
+tx.callFunction({
+  target: '0x3::empty::empty_with_signer',
+  maxGas: 100000000, // 1RGas, DEFAULT_GAS 50000000 = 0.5RGas
+})
+
+const result = await client.signAndExecuteTransaction({
+  transaction: tx,
+  signer: session,
+})
 ```
 
 ## Reading APIs
@@ -98,78 +123,137 @@ const result = keypairAccount.runFunction(
 ### Move view
 
 ```typescript
-import { JsonRpcProvider, DevChain } from '@roochnetwork/rooch-sdk'
-const provider = new JsonRpcProvider(DevChain)
+import { RoochClient, getRoochNodeUrl } from '@roochnetwork/rooch-sdk'
 
-const result = provider.executeViewFunction(
+const client = new RoochClient({
+  url: getRoochNodeUrl('devnet'),
+})
+
+const result = await client.executeViewFunction(
   '0x49ee3cf17a017b331ab2b8a4d40ecc9706f328562f9db63cba625a9c106cdf35::counter::view',
 )
 ```
 
-##
+## Subscriptions
 
-### Get Transactions By Hash
+The SDK supports real-time subscriptions to events and transactions using WebSocket connections. Subscriptions allow your application to receive updates in real-time without polling.
 
-```typescript
-import { JsonRpcProvider, DevChain } from '@roochnetwork/rooch-sdk'
-const provider = new JsonRpcProvider(DevChain)
+### Setting up a Subscription
 
-const allTransaction = provider.getTransactionsByHash([
-  '0x70c42b134148cbe598b347c66574fc19f5a0fb6ee33df37255a96d8a8310c7a5',
-])
-```
-
-### listTransactions
+To use subscriptions, you must initialize your `RoochClient` with a WebSocket transport:
 
 ```typescript
-import { JsonRpcProvider, DevChain } from '@roochnetwork/rooch-sdk'
-const provider = new JsonRpcProvider(DevChain)
+import { RoochClient, RoochWebSocketTransport, getRoochNodeUrl } from '@roochnetwork/rooch-sdk'
 
-const allTransaction = provider.getTransactionsByHash([
-  '0x70c42b134148cbe598b347c66574fc19f5a0fb6ee33df37255a96d8a8310c7a5',
-])
+// Create WebSocket transport
+const wsTransport = new RoochWebSocketTransport({
+  url: getRoochNodeUrl('testnet'),
+})
+
+// Create client with WebSocket transport
+const client = new RoochClient({
+  transport: wsTransport,
+  subscriptionTransport: wsTransport, // Use the same transport for subscriptions
+})
+
+// Now you can use subscriptions
 ```
 
-### Get State
-
-Refer to [this storage guide](https://rooch.network/zh-CN/docs/dive-into-rooch/storage-abstraction) for more information.
+### Subscribing to Events
 
 ```typescript
-import { JsonRpcProvider, DevChain } from '@roochnetwork/rooch-sdk'
-const provider = new JsonRpcProvider(DevChain)
+// Subscribe to all events
+const eventSubscription = await client.subscribe({
+  type: 'event',
+  onEvent: (event) => {
+    console.log('Received event:', event.data)
+  },
+  onError: (error) => {
+    console.error('Subscription error:', error)
+  },
+})
 
-const state = provider.getStates('object/0x1')
+// Subscribe to events with a filter
+const filteredEventSubscription = await client.subscribe({
+  type: 'event',
+  filter: {
+    sender: '0x123...', // Filter events by sender
+  },
+  onEvent: (event) => {
+    console.log('Received filtered event:', event.data)
+  },
+})
+
+// Later, unsubscribe when no longer needed
+client.unsubscribe(eventSubscription.id)
 ```
 
-### Get List States
-
-Refer to [this storage guide](https://rooch.network/zh-CN/docs/dive-into-rooch/storage-abstraction) for more information.
+### Subscribing to Transactions
 
 ```typescript
-import { JsonRpcProvider, DevChain } from '@roochnetwork/rooch-sdk'
-const provider = new JsonRpcProvider(DevChain)
+// Subscribe to all transactions
+const txSubscription = await client.subscribe({
+  type: 'transaction',
+  onEvent: (event) => {
+    console.log('Received transaction:', event.data)
+  },
+  onError: (error) => {
+    console.error('Subscription error:', error)
+  },
+})
 
-const states = provider.listStates('object/0x1', null, 10)
+// Subscribe to transactions with a filter
+const filteredTxSubscription = await client.subscribe({
+  type: 'transaction',
+  filter: {
+    sender: '0x123...', // Filter transactions by sender
+  },
+  onEvent: (event) => {
+    console.log('Received filtered transaction:', event.data)
+  },
+})
+
+// Later, unsubscribe when no longer needed
+client.unsubscribe(txSubscription.id)
 ```
 
-## Project Structure
+### Subscription Events
 
-The Rooch TypeScript SDK provides APIs and interfaces you can use to interact with the Rooch network for reading the blockchain state and for sending your transaction to the Rooch network.
+The
 
-The Rooch TypeScript SDK has three logical layers:
+onEvent
 
-Plugins layer Implementation of different use cases such as Token etc.
-Core layer – Exposes the functionalities needed by most applications.
-Transport Layer Responsible on communication with the blockchain server.
+callback receives an object with:
 
-See below a high-level architecture diagram of the Rooch TypeScript SDK.
+-
 
-## File Structure
+type
 
-```
-├── examples                      // all the cases examples go into here
-├── src                           // TODO:
-└── test                          // e2e the test are in here
+: Either 'event' or 'transaction'
+
+-
+
+data
+
+: The event or transaction data
+
+### Handling Connection Issues
+
+The WebSocket transport automatically handles reconnection on connection loss. You can configure its behavior using the options described in the WebSocket Connection section above.
+
+When reconnection happens, subscriptions are automatically re-established.
+
+### Cleaning Up
+
+Always clean up resources when done:
+
+```typescript
+// Unsubscribe from all subscriptions
+client.unsubscribe(subscription1.id)
+client.unsubscribe(subscription2.id)
+
+// Destroy the client to free resources
+client.destroy()
 ```
 
 ## Building Locally
@@ -194,5 +278,12 @@ For the latest docs for the `main` branch, run `pnpm doc` and open the [doc/inde
 To run tests
 
 ```
+pnpm test
+```
+
+## check compatibility
+
+```
+pnpm gen
 pnpm test
 ```

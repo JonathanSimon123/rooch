@@ -8,9 +8,8 @@ use crate::Stdlib;
 use anyhow::{bail, ensure, Result};
 use framework_types::addresses::ROOCH_NURSERY_ADDRESS;
 use itertools::Itertools;
-use move_binary_format::{
-    compatibility::Compatibility, errors::PartialVMResult, normalized::Module, CompiledModule,
-};
+use move_binary_format::{compatibility::Compatibility, errors::PartialVMResult, CompiledModule};
+use moveos_types::moveos_std::module_store::PackageData;
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
@@ -82,7 +81,8 @@ pub fn release(version: StdlibVersion, check_compatibility: bool) -> Result<Vec<
         }
     }
 
-    version.save(&curr_stdlib)?;
+    version.save(&curr_stdlib)?; // save the whole stdlib(legacy format).
+    version.save_each_package(&curr_stdlib)?;
     info!(
         "Release stdlib version {:?} successfully.",
         version.as_string()
@@ -112,15 +112,23 @@ fn current_max_version() -> u64 {
 
 /// Check whether the new stdlib is compatible with the old stdlib
 fn check_stdlib_compatibility(curr_stdlib: &Stdlib, prev_stdlib: &Stdlib) -> Result<()> {
-    let new_modules_map = curr_stdlib
-        .all_modules()
-        .expect("Extract modules from new stdlib failed")
+    check_modules_compat(
+        curr_stdlib.all_modules()?,
+        prev_stdlib.all_modules()?,
+        false,
+    )
+}
+
+pub fn check_modules_compat(
+    new_modules: Vec<CompiledModule>,
+    old_modules: Vec<CompiledModule>,
+    allow_deleted_module: bool,
+) -> Result<()> {
+    let new_modules_map = new_modules
         .into_iter()
         .map(|module| (module.self_id(), module))
         .collect::<HashMap<_, _>>();
-    let old_modules_map = prev_stdlib
-        .all_modules()
-        .expect("Extract modules from old stdlib failed")
+    let old_modules_map = old_modules
         .into_iter()
         .map(|module| (module.self_id(), module))
         .collect::<HashMap<_, _>>();
@@ -175,15 +183,34 @@ fn check_stdlib_compatibility(curr_stdlib: &Stdlib, prev_stdlib: &Stdlib) -> Res
         })
         .collect::<Vec<_>>();
 
-    ensure!(
-        deleted_module_ids.is_empty(),
-        "Modules {} is deleted!",
-        deleted_module_ids
-            .into_iter()
-            .map(|module_id| module_id.to_string())
-            .join(",")
-    );
+    if !allow_deleted_module {
+        ensure!(
+            deleted_module_ids.is_empty(),
+            "Modules {} is deleted!",
+            deleted_module_ids
+                .into_iter()
+                .map(|module_id| module_id.to_string())
+                .join(",")
+        );
+    } else if !deleted_module_ids.is_empty() {
+        warn!(
+            "Modules {} is deleted in local, but them still on the Chain!. If you want to deprecated them, please abort the all public functions in the module.",
+            deleted_module_ids
+                .into_iter()
+                .map(|module_id| module_id.to_string())
+                .join(",")
+        );
+    }
     Ok(())
+}
+
+pub fn check_package_compat(
+    new_package_data: PackageData,
+    pre_package_data: PackageData,
+) -> Result<()> {
+    let new_modules = new_package_data.compiled_modules()?;
+    let pre_modules = pre_package_data.compiled_modules()?;
+    check_modules_compat(new_modules, pre_modules, false)
 }
 
 /// check module compatibility
@@ -199,10 +226,8 @@ fn check_compiled_module_compat(
         new_module.self_id(),
         old_module.self_id()
     );
-    let new_m = Module::new(new_module);
-    let old_m = Module::new(old_module);
-    // TODO: config compatibility through global configuration
-    // We allow `friend` function to be broken
-    let compat = Compatibility::new(true, true, false);
-    compat.check(&old_m, &new_m)
+    //We enable all compatibility checks, do not allow friend functions break after the issue
+    //https://github.com/rooch-network/rooch/pull/3465
+    let compat = Compatibility::new(true, true, true, true);
+    compat.check(old_module, new_module)
 }

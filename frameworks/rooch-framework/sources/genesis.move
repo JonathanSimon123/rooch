@@ -4,7 +4,11 @@
 module rooch_framework::genesis {
 
     use std::option;
+    use std::vector;
+    use moveos_std::signer;
     use moveos_std::tx_context;
+    use moveos_std::module_store;
+    use moveos_std::core_addresses;
     use rooch_framework::account;
     use rooch_framework::auth_validator_registry;
     use rooch_framework::builtin_validators;
@@ -16,19 +20,31 @@ module rooch_framework::genesis {
     use rooch_framework::address_mapping;
     use rooch_framework::onchain_config;
     use rooch_framework::bitcoin_address::{Self, BitcoinAddress};
-
+    use rooch_framework::did;
+    use rooch_framework::payment_channel;
 
     const ErrorGenesisInit: u64 = 1;
+
+    const GENESIS_INIT_GAS_AMOUNT: u256 = 500000000_00000000u256;
+    const GENESIS_INIT_RGAS_LOCKED_UNIT: u256 = 100_00000000u256;
 
     /// GenesisContext is a genesis init parameters in the TxContext.
     struct GenesisContext has copy,store,drop{
         chain_id: u64,
         /// Sequencer account
         sequencer: BitcoinAddress, 
+        /// Rooch DAO multisign account
+        rooch_dao: BitcoinAddress, 
     }
 
     fun init(){
-        let genesis_account = &account::create_system_account(@rooch_framework);
+        // create all system accounts
+        let system_addresses = core_addresses::list_system_reserved_addresses();
+        vector::for_each(system_addresses, |addr| {
+            let _ = account::create_system_account(addr);
+        });
+
+        let genesis_account = &signer::module_signer<GenesisContext>();
         let genesis_context_option = tx_context::get_attribute<GenesisContext>();
         assert!(option::is_some(&genesis_context_option), ErrorGenesisInit);
         let genesis_context = option::extract(&mut genesis_context_option);
@@ -41,17 +57,57 @@ module rooch_framework::genesis {
         transaction_fee::genesis_init(genesis_account);
         address_mapping::genesis_init(genesis_account);
         let sequencer_addr = bitcoin_address::to_rooch_address(&genesis_context.sequencer);
-        onchain_config::genesis_init(genesis_account, sequencer_addr);
-
+        
         // Some test cases use framework account as sequencer, it may already exist
         if(!moveos_std::account::exists_at(sequencer_addr)){
             account::create_account(sequencer_addr);
-            address_mapping::bind_bitcoin_address(sequencer_addr, genesis_context.sequencer);
+            address_mapping::bind_bitcoin_address_internal(sequencer_addr, genesis_context.sequencer);
         };
-        // give some gas coin to the sequencer
-        gas_coin::faucet(sequencer_addr, 1000000_00000000u256);
+        let rooch_dao_address = bitcoin_address::to_rooch_address(&genesis_context.rooch_dao);
+
+        onchain_config::genesis_init(genesis_account, sequencer_addr, rooch_dao_address);
+        
+        let framework_upgrade_address = if(chain_id::is_main()){
+            rooch_dao_address
+        } else {
+            //we use sequencer as framework upgrade address in local/dev/test network for easy testing
+            sequencer_addr
+        };
+        // issue framework packages upgrade cap to the rooch dao
+        let system_addresses = core_addresses::list_system_reserved_addresses();
+        vector::for_each(system_addresses, |addr| {
+            module_store::issue_upgrade_cap_by_system(genesis_account, addr, framework_upgrade_address);
+        });
+        
+        // issue rooch dao upgrade cap
+        module_store::issue_upgrade_cap_by_system(genesis_account, rooch_dao_address, framework_upgrade_address);
+        
+        // give initial gas to the rooch dao
+        gas_coin::faucet(rooch_dao_address, GENESIS_INIT_GAS_AMOUNT);
+
+        // give initial gas to the sequencer if it's not mainnet
+        if(!chain_id::is_main()){
+            gas_coin::faucet(sequencer_addr, GENESIS_INIT_GAS_AMOUNT);
+        };
+
+        init_v23();
+        init_v25(genesis_account);
     }
 
+    public entry fun init_v23(){
+        did::genesis_init();
+    }
+
+    public entry fun init_v25(sender: &signer){
+        // Only set locked unit on mainnet, keep 0 for test/dev networks
+        if(chain_id::is_main()){
+            payment_channel::set_locked_unit<gas_coin::RGas>(sender, GENESIS_INIT_RGAS_LOCKED_UNIT);
+        };
+    }
+
+    public fun genesis_init_rgas_locked_unit() : u256 {
+        GENESIS_INIT_RGAS_LOCKED_UNIT
+    }
 
     #[test_only]
     use moveos_std::genesis;
@@ -60,8 +116,8 @@ module rooch_framework::genesis {
     /// init the genesis context for test
     public fun init_for_test(){
         let genesis_account = moveos_std::signer::module_signer<GenesisContext>();
-        let sequencer = bitcoin_address::from_string(&std::string::utf8(b"1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"));
-        tx_context::add_attribute_via_system(&genesis_account, GenesisContext{chain_id: 3, sequencer});
+        let sequencer = bitcoin_address::from_string(&std::string::utf8(b"bc1pxup9p7um3t5knqn0yxfrq5d0mgul9ts993j32tsfxn68qa4pl3nq2qhh2e"));
+        tx_context::add_attribute_via_system(&genesis_account, GenesisContext{chain_id: 3, sequencer, rooch_dao: bitcoin_address::from_string(&std::string::utf8(b"bc1pevdrc8yqmgd94h2mpz9st0u77htmx935hzck3ruwsvcf4w7wrnqqd0yvze"))});
         genesis::init_for_test();
         init();
     }

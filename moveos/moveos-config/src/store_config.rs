@@ -51,6 +51,36 @@ pub struct RocksdbConfig {
     pub block_cache_size: u64,
     #[clap(name = "rocksdb-block-size", long, help = "rocksdb block size")]
     pub block_size: u64,
+    #[clap(
+        name = "rocksdb-enable-statistics",
+        long,
+        help = "rocksdb enable statistics"
+    )]
+    pub enable_statistics: bool,
+    #[clap(
+        name = "rocksdb-compaction-readahead-size",
+        long,
+        help = "rocksdb compaction readahead size in bytes"
+    )]
+    pub compaction_readahead_size: u64,
+    #[clap(
+        name = "rocksdb-allow-mmap-reads",
+        long,
+        help = "enable mmap reads for rocksdb"
+    )]
+    pub allow_mmap_reads: bool,
+    #[clap(
+        name = "rocksdb-advise-random-on-open",
+        long,
+        help = "call advise random on open for rocksdb files"
+    )]
+    pub advise_random_on_open: bool,
+    #[clap(
+        name = "rocksdb-disable-auto-compactions",
+        long,
+        help = "disable RocksDB auto compactions for all column families"
+    )]
+    pub disable_auto_compactions: bool,
 }
 
 impl RocksdbConfig {
@@ -77,6 +107,30 @@ impl Default for RocksdbConfig {
             max_write_buffer_numer: 4,
             block_cache_size: 1u64 << 32,
             block_size: 4 * 1024,
+            enable_statistics: false,
+            compaction_readahead_size: 2 * 1024 * 1024,
+            allow_mmap_reads: false,
+            advise_random_on_open: true,
+            disable_auto_compactions: false,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Deserialize, PartialEq, Eq, Serialize, Parser)]
+#[serde(default, deny_unknown_fields)]
+pub struct MoveOSStoreConfig {
+    #[clap(
+        name = "moveos-store-state-cache-size",
+        long,
+        help = "MoveOS store state cache size"
+    )]
+    pub state_cache_size: usize,
+}
+
+impl Default for MoveOSStoreConfig {
+    fn default() -> Self {
+        Self {
+            state_cache_size: 10_000,
         }
     }
 }

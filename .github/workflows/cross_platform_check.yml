@@ -1,0 +1,222 @@
+name: Cross-Platform Build Check (Optimized)
+
+on:
+  push:
+    branches: [ 'main' ]
+    paths-ignore:
+      - 'docs/**'
+      - 'fixtures/**'
+      - 'kube/**'
+      - '**.md'
+      - 'crates/rooch-anomalies/static/**'
+  pull_request:
+    branches: [ 'main' ]
+    paths-ignore:
+      - 'docs/**'
+      - 'fixtures/**'
+      - 'kube/**'
+      - '**.md'
+      - 'crates/rooch-anomalies/static/**'
+  workflow_run:
+    workflows: ["Check-Build-Test"]
+    types:
+      - completed
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.workflow_run.head_branch || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Optimize for disk space and stability
+  CARGO_BUILD_JOBS: 2
+  CARGO_NET_RETRY: 10
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  GIT_CONFIG_COUNT: 2
+  GIT_CONFIG_KEY_0: http.version
+  GIT_CONFIG_VALUE_0: HTTP/1.1
+  GIT_CONFIG_KEY_1: http.maxRequests
+  GIT_CONFIG_VALUE_1: "2"
+
+jobs:
+  cross_platform_build:
+    name: Cross-Platform Build Check
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' || github.event_name == 'push' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: self-hosted
+            target: x86_64-unknown-linux-gnu
+          # Temporarily disable Windows due to libgit2_sys linking issues with Rust 1.91
+          # Track fix in: https://github.com/rooch-network/rooch/issues/3777
+          # - os: windows-latest
+          #   target: x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check disk space before build (Unix)
+        if: matrix.os != 'windows-latest'
+        run: df -h
+
+      - name: Check disk space before build (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Write-Host "=== Disk Space Before Build ==="
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{Name='Used(GB)';Expression={[math]::Round($_.Used/1GB,2)}}, @{Name='Free(GB)';Expression={[math]::Round($_.Free/1GB,2)}}
+
+      - name: Setup Rust (self-hosted Linux)
+        if: matrix.os == 'self-hosted'
+        uses: ./.github/actions/rust-setup
+
+      - name: Install Rust toolchain
+        if: matrix.os == 'windows-latest'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'self-hosted'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            gcc \
+            libssl-dev \
+            pkg-config \
+            libclang-dev \
+            protobuf-compiler \
+            lld \
+            clang
+
+      - name: Install Windows dependencies
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: |
+          Set-ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
+          Invoke-Expression (New-Object System.Net.WebClient).DownloadString('https://get.scoop.sh')
+
+          $env:PATH += ";$env:USERPROFILE\scoop\shims"
+
+          scoop bucket add main
+          scoop bucket add extras
+
+          scoop install llvm
+          scoop install mingw
+          scoop install protobuf
+          scoop install cmake
+
+          echo "$env:USERPROFILE\scoop\shims" >> $env:GITHUB_PATH
+          echo "$env:USERPROFILE\scoop\apps\protobuf\current\bin" >> $env:GITHUB_PATH
+          echo "$env:USERPROFILE\scoop\apps\llvm\current\bin" >> $env:GITHUB_PATH
+          echo "$env:USERPROFILE\scoop\apps\mingw\current\bin" >> $env:GITHUB_PATH
+          echo "$env:USERPROFILE\scoop\apps\cmake\current\bin" >> $env:GITHUB_PATH
+
+      - name: Set Rust environment variables (Linux)
+        if: matrix.os == 'self-hosted'
+        shell: bash
+        run: |
+          echo "Linux build will use config from .cargo/config.toml"
+
+      - name: Set Protoc Environment Variables
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
+
+      - name: Set Windows environment variables
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          echo "LIBGIT2_SYS_USE_PKG_CONFIG=0" >> $GITHUB_ENV
+          echo "LIBGIT2_SYS_USE_VCPKG=0" >> $GITHUB_ENV
+          echo "SKIP_STDLIB_BUILD=1" >> $GITHUB_ENV
+
+      # Fast check for PRs (only syntax checking, minimal disk usage)
+      - name: Quick syntax check (PR only, Unix)
+        if: github.event_name == 'pull_request' && matrix.os != 'windows-latest'
+        run: |
+          echo "Running quick check for PR (cargo check)..."
+          cargo check --target ${{ matrix.target }} --jobs 2
+          echo "=== Quick check completed ==="
+          df -h
+        env:
+          OPENSSL_DIR: /usr
+          OPENSSL_LIB_DIR: /usr/lib/x86_64-linux-gnu
+          OPENSSL_INCLUDE_DIR: /usr/include
+          LIBGIT2_SYS_USE_PKG_CONFIG: '1'
+
+      - name: Quick syntax check (PR only, Windows)
+        if: github.event_name == 'pull_request' && matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Write-Host "Running quick check for PR (cargo check)..."
+          cargo check --target ${{ matrix.target }} --jobs 2
+          Write-Host "=== Quick check completed ==="
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{Name='Used(GB)';Expression={[math]::Round($_.Used/1GB,2)}}, @{Name='Free(GB)';Expression={[math]::Round($_.Free/1GB,2)}}
+
+      # Full build only for main branch (10-20GB)
+      - name: Build (Debug, Main Branch Only, Unix)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.os != 'windows-latest'
+        run: |
+          echo "Starting full debug build for main branch..."
+          cargo build --target ${{ matrix.target }} --jobs 2
+          echo "=== Build completed ==="
+          df -h
+          echo "=== Target directory size ==="
+          du -sh target 2>/dev/null || echo "No target dir yet"
+        env:
+          OPENSSL_DIR: /usr
+          OPENSSL_LIB_DIR: /usr/lib/x86_64-linux-gnu
+          OPENSSL_INCLUDE_DIR: /usr/include
+          LIBGIT2_SYS_USE_PKG_CONFIG: '1'
+
+      - name: Build (Debug, Main Branch Only, Windows)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Write-Host "Starting full debug build for main branch..."
+          cargo build --target ${{ matrix.target }} --jobs 2
+          Write-Host "=== Build completed ==="
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{Name='Used(GB)';Expression={[math]::Round($_.Used/1GB,2)}}, @{Name='Free(GB)';Expression={[math]::Round($_.Free/1GB,2)}}
+
+      - name: Check disk space after build (Unix)
+        if: always() && matrix.os != 'windows-latest'
+        run: |
+          echo "=== Final disk usage ==="
+          df -h
+          echo "=== Cargo cache size ==="
+          du -sh ~/.cargo 2>/dev/null || echo "No cargo cache"
+          echo "=== Target directory ==="
+          du -sh target 2>/dev/null || echo "No target dir"
+
+      - name: Check disk space after build (Windows)
+        if: always() && matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Write-Host "=== Final disk usage ==="
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{Name='Used(GB)';Expression={[math]::Round($_.Used/1GB,2)}}, @{Name='Free(GB)';Expression={[math]::Round($_.Free/1GB,2)}}
+
+      - name: Upload build failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: build-failure-${{ matrix.os }}-${{ matrix.target }}
+          path: |
+            build.log
+            target/
+          retention-days: 7
+
+      # Note: No cargo clean - rust-cache handles cache management automatically
+      # Build artifacts are preserved for faster subsequent builds

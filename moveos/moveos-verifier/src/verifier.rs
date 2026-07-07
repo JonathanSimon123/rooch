@@ -51,6 +51,20 @@ where
         verify_data_struct(module, &db, &mut verified_modules)?;
     }
 
+    for module in modules {
+        let mut module_bytes = vec![];
+        match module.serialize(&mut module_bytes) {
+            Ok(_) => {}
+            Err(_) => {
+                return Err(PartialVMError::new(StatusCode::VALUE_SERIALIZATION_ERROR)
+                    .finish(Location::Undefined))
+            }
+        }
+        let budget = 2048 + module_bytes.len() as u64 * 5;
+        crate::check_complexity::check_module_complexity(module, budget)
+            .map_err(|err| err.finish(Location::Undefined))?;
+    }
+
     Ok(true)
 }
 
@@ -161,9 +175,42 @@ pub fn verify_entry_function_at_publish(module: &CompiledModule) -> VMResult<boo
                 );
             }
         }
+
+        let mut signer_argument_length = 0;
+        for parameter_type in func_parameters_types.iter() {
+            if is_signer(parameter_type) {
+                signer_argument_length += 1;
+                if signer_argument_length > 1 {
+                    return generate_vm_error(
+                        ErrorCode::INVALID_PARAM_SINGER_COUNT,
+                        "Multiple signer arguments detected.".to_string(),
+                        Some(fdef.function),
+                        module,
+                    );
+                }
+            }
+        }
+
+        if signer_argument_length == 1 {
+            if let Some(argument_type) = func_parameters_types.first() {
+                if !is_signer(argument_type) {
+                    return generate_vm_error(
+                        ErrorCode::INVALID_FIRST_ARGUMENT_IS_NOT_SIGNER,
+                        "The first argument is not a signer argument.".to_string(),
+                        Some(fdef.function),
+                        module,
+                    );
+                }
+            }
+        }
     }
 
     Ok(true)
+}
+
+fn is_signer(t: &SignatureToken) -> bool {
+    matches!(t, SignatureToken::Signer)
+        || matches!(t, SignatureToken::Reference(r) if matches!(**r, SignatureToken::Signer))
 }
 
 pub fn verify_entry_function<S>(
@@ -1134,7 +1181,7 @@ fn struct_def_from_struct_handle<Resolver>(
     verified_modules: &mut BTreeMap<ModuleId, CompiledModule>,
     struct_name: &str,
     db: &Resolver,
-) -> Option<StructDefinition>
+) -> Option<(StructDefinition, CompiledModule)>
 where
     Resolver: ModuleResolver,
 {
@@ -1144,7 +1191,7 @@ where
         let iterator_struct_name =
             struct_full_name_from_sid(&struct_handle_idx, &current_module_bin_view);
         if iterator_struct_name == struct_name {
-            return Some(struct_def.clone());
+            return Some((struct_def.clone(), current_module.clone()));
         }
     }
 
@@ -1155,7 +1202,7 @@ where
             let iterator_struct_name =
                 struct_full_name_from_sid(&struct_handle_idx, &iterator_module_bin_view);
             if iterator_struct_name == struct_name {
-                return Some(struct_def.clone());
+                return Some((struct_def.clone(), m.clone()));
             }
         }
     }
@@ -1173,7 +1220,7 @@ where
                 let iterator_struct_name =
                     struct_full_name_from_sid(&struct_handle_idx, &target_module_bin_view);
                 if iterator_struct_name == struct_name {
-                    return Some(struct_def.clone());
+                    return Some((struct_def.clone(), target_module));
                 }
             }
             None
@@ -1408,7 +1455,7 @@ where
         db,
     );
     match struct_def_opt {
-        Some(struct_def) => validate_struct_fields(
+        Some((struct_def, _)) => validate_struct_fields(
             &struct_def,
             current_module,
             module_bin_view,
@@ -1863,19 +1910,21 @@ where
     );
 
     let mut struct_fields = Vec::new();
-    if let Some(struct_def) = struct_def_opt {
-        let field_count = struct_def.declared_field_count().unwrap();
-        for field_idx in 0..field_count {
-            let field_def = struct_def.field(field_idx as usize).unwrap().clone();
-            struct_fields.push(field_def);
-        }
+    let mut target_module = caller_module.clone();
+    if let Some((struct_def, m)) = struct_def_opt {
+        let v = match struct_def.field_information {
+            StructFieldInformation::Native => vec![],
+            StructFieldInformation::Declared(v) => v,
+        };
+        target_module = m.clone();
+        struct_fields.extend(v);
     }
 
     let formulas = struct_fields
         .iter()
         .map(|field_def| {
             calculate_depth_of_type(
-                caller_module,
+                &target_module,
                 verified_modules,
                 db,
                 &field_def.signature.0.clone(),
@@ -2030,4 +2079,216 @@ impl TypeDepthFormula {
 
         Ok(TypeDepthFormula::normalize(formulas))
     }
+}
+
+/// Check the metadata compatibility between the new and old modules.
+pub fn check_metadata_compatibility(
+    old_module: &CompiledModule,
+    new_module: &CompiledModule,
+) -> VMResult<bool> {
+    let old_module_metadata = match get_metadata_from_compiled_module(old_module) {
+        None => {
+            return generate_vm_error(
+                ErrorCode::MALFORMED_METADATA,
+                "malformed metadata format".to_string(),
+                None,
+                old_module,
+            );
+        }
+        Some(metadata) => metadata,
+    };
+
+    let new_module_metadata = match get_metadata_from_compiled_module(new_module) {
+        None => {
+            return generate_vm_error(
+                ErrorCode::MALFORMED_METADATA,
+                "malformed metadata format".to_string(),
+                None,
+                new_module,
+            );
+        }
+        Some(metadata) => metadata,
+    };
+
+    for (struct_name, is_data_struct) in old_module_metadata.data_struct_map.iter() {
+        match new_module_metadata.data_struct_map.get(struct_name) {
+            None => {
+                return generate_vm_error(
+                    ErrorCode::INVALID_DATA_STRUCT_INCOMPATIBLE_REMOVE,
+                    "data struct in module is not compatibility with the old one.".to_string(),
+                    None,
+                    new_module,
+                )
+            }
+            Some(v) => {
+                if *v != *is_data_struct {
+                    return generate_vm_error(
+                        ErrorCode::INVALID_DATA_STRUCT_INCOMPATIBLE_MODIFY,
+                        "data struct in module is not compatibility with the old one".to_string(),
+                        None,
+                        new_module,
+                    );
+                }
+            }
+        }
+    }
+
+    for (struct_name, data_struct_type_parameters_indicies) in
+        old_module_metadata.data_struct_func_map.iter()
+    {
+        match new_module_metadata.data_struct_func_map.get(struct_name) {
+            None => {
+                return generate_vm_error(
+                    ErrorCode::INVALID_DATA_STRUCT_FUNC_INCOMPATIBLE_REMOVE,
+                    "data struct func in module is not compatibility with the old one.".to_string(),
+                    None,
+                    new_module,
+                )
+            }
+            Some(v) => {
+                if *v != *data_struct_type_parameters_indicies {
+                    return generate_vm_error(
+                        ErrorCode::INVALID_DATA_STRUCT_FUNC_INCOMPATIBLE_MODIFY,
+                        "data struct in module is not compatibility with the old one".to_string(),
+                        None,
+                        new_module,
+                    );
+                }
+            }
+        }
+    }
+
+    for (struct_name, private_generics_type_parameters_indicies) in
+        old_module_metadata.private_generics_indices.iter()
+    {
+        match new_module_metadata
+            .private_generics_indices
+            .get(struct_name)
+        {
+            None => {
+                return generate_vm_error(
+                    ErrorCode::INVALID_PRIVATE_GENERICS_INCOMPATIBLE_REMOVE,
+                    "private generics in module is not compatibility with the old one.".to_string(),
+                    None,
+                    new_module,
+                )
+            }
+            Some(v) => {
+                if *v != *private_generics_type_parameters_indicies {
+                    return generate_vm_error(
+                        ErrorCode::INVALID_PRIVATE_GENERICS_INCOMPATIBLE_MODIFY,
+                        "private generics in module is not compatibility with the old one"
+                            .to_string(),
+                        None,
+                        new_module,
+                    );
+                }
+            }
+        }
+    }
+
+    let mut data_struct_difference = BTreeMap::new();
+    let mut data_struct_func_difference = BTreeMap::new();
+    let mut private_generics_difference = BTreeMap::new();
+
+    for (struct_name, is_data_struct) in new_module_metadata.data_struct_map.iter() {
+        if old_module_metadata.data_struct_map.get(struct_name) != Some(is_data_struct) {
+            data_struct_difference.insert(struct_name.clone(), *is_data_struct);
+        }
+    }
+
+    for (func_name, data_struct_type_parameters_indicies) in
+        new_module_metadata.data_struct_func_map.iter()
+    {
+        if old_module_metadata.data_struct_func_map.get(func_name)
+            != Some(data_struct_type_parameters_indicies)
+        {
+            data_struct_func_difference.insert(
+                func_name.clone(),
+                data_struct_type_parameters_indicies.clone(),
+            );
+        }
+    }
+
+    for (struct_name, private_generics_type_parameters_indicies) in
+        new_module_metadata.private_generics_indices.iter()
+    {
+        if old_module_metadata
+            .private_generics_indices
+            .get(struct_name)
+            != Some(private_generics_type_parameters_indicies)
+        {
+            private_generics_difference.insert(
+                struct_name.clone(),
+                private_generics_type_parameters_indicies.clone(),
+            );
+        }
+    }
+
+    // Temporarily disable this check.
+    /*
+    for (struct_name, _) in data_struct_difference {
+        if struct_in_module(old_module, struct_name.as_str()) {
+            return generate_vm_error(
+                ErrorCode::INVALID_DATA_STRUCT_INCOMPATIBLE_WITH_EXISTS,
+                "cannot add data_struct to the exist struct".to_string(),
+                None,
+                new_module,
+            );
+        }
+    }
+     */
+
+    for (func_name, _) in data_struct_func_difference {
+        if func_in_module(old_module, func_name.as_str()) {
+            return generate_vm_error(
+                ErrorCode::INVALID_DATA_STRUCT_FUNC_INCOMPATIBLE_WITH_EXISTS,
+                "cannot add data_struct_func to the exist function".to_string(),
+                None,
+                new_module,
+            );
+        }
+    }
+
+    for (func_name, _) in private_generics_difference {
+        if func_in_module(old_module, func_name.as_str()) {
+            return generate_vm_error(
+                ErrorCode::INVALID_PRIVATE_GENERICS_INCOMPATIBLE_WITH_EXISTS,
+                "cannot add private_generics to the exist function".to_string(),
+                None,
+                new_module,
+            );
+        }
+    }
+
+    Ok(true)
+}
+
+#[allow(dead_code)]
+fn struct_in_module(module: &CompiledModule, other_struct_name: &str) -> bool {
+    let module_name_address = module.self_id().short_str_lossless();
+    for struct_def in module.struct_defs.iter() {
+        let struct_handle = module.struct_handle_at(struct_def.struct_handle);
+        let struct_name = module.identifier_at(struct_handle.name).to_string();
+        let struct_full_name = format!("{}::{}", module_name_address.clone(), struct_name);
+        if other_struct_name == struct_full_name {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn func_in_module(module: &CompiledModule, other_func_name: &str) -> bool {
+    let module_name_address = module.self_id().short_str_lossless();
+    for func_def in module.function_defs.iter() {
+        let func_handle = module.function_handle_at(func_def.function);
+        let func_name = module.identifier_at(func_handle.name).to_string();
+        let full_func_name = format!("{}::{}", module_name_address.clone(), func_name);
+        if other_func_name == full_func_name {
+            return true;
+        }
+    }
+
+    false
 }

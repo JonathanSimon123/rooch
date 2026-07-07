@@ -18,6 +18,7 @@ use moveos_types::{
 };
 use std::collections::VecDeque;
 
+use crate::natives::helpers;
 pub use moveos_object_runtime::runtime::{
     ERROR_ALREADY_EXISTS, ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_BORROWED,
     ERROR_OBJECT_ALREADY_TAKEN_OUT_OR_EMBEDED, ERROR_OBJECT_RUNTIME_ERROR, ERROR_TYPE_MISMATCH,
@@ -26,6 +27,8 @@ pub use moveos_object_runtime::runtime::{
 mod object_field_fn;
 mod object_fn;
 mod object_meta_fn;
+
+pub use object_field_fn::{ListFieldsGasParameters, ListFieldsGasParametersOption};
 
 #[derive(Debug, Clone)]
 pub struct CommonGasParameters {
@@ -51,8 +54,8 @@ impl CommonGasParameters {
 pub(crate) fn pop_object_id(args: &mut VecDeque<Value>) -> PartialVMResult<ObjectID> {
     let handle = args.pop_back().unwrap();
     ObjectID::from_runtime_value(handle).map_err(|e| {
-        if log::log_enabled!(log::Level::Debug) {
-            log::warn!("[ObjectRuntime] get_object_id: {:?}", e);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::warn!("[ObjectRuntime] get_object_id: {:?}", e);
         }
         PartialVMError::new(StatusCode::TYPE_RESOLUTION_FAILURE).with_message(e.to_string())
     })
@@ -66,7 +69,7 @@ pub(crate) fn read_object_id(value: &Value) -> PartialVMResult<ObjectID> {
 }
 
 pub(crate) fn partial_extension_error(msg: impl ToString) -> PartialVMError {
-    log::debug!("PartialVMError: {}", msg.to_string());
+    tracing::debug!("PartialVMError: {}", msg.to_string());
     PartialVMError::new(StatusCode::VM_EXTENSION_ERROR).with_message(msg.to_string())
 }
 
@@ -81,13 +84,15 @@ pub(crate) fn error_to_abort_code(err: PartialVMError) -> u64 {
         StatusCode::ABORTED => err.sub_status().unwrap_or(ERROR_OBJECT_RUNTIME_ERROR),
         _ => ERROR_OBJECT_RUNTIME_ERROR,
     };
-    if log::log_enabled!(log::Level::Debug) {
-        log::warn!(
-            "[ObjectRuntime] error err: {:?}, abort: {}",
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        tracing::warn!(
+            "[ObjectRuntime] error_to_abort_code: err={:?}, major={:?}, sub={:?}, abort={}",
             err,
+            err.major_status(),
+            err.sub_status(),
             abort_code
         );
-    };
+    }
     abort_code
 }
 
@@ -101,12 +106,14 @@ pub struct GasParameters {
     pub native_transfer_object: TransferObjectGasParameters,
     pub native_to_shared_object: ToSharedObjectGasParameters,
     pub native_to_frozen_object: ToFrozenObjectGasParameters,
+    pub native_clear_fields: ClearFieldsGasParameters,
     // Object field functions
     pub native_add_field: AddFieldGasParameters,
     pub native_borrow_field: BorrowFieldGasParameters,
     pub native_contains_field: ContainsFieldGasParameters,
     pub native_contains_field_with_value_type: ContainsFieldGasParameters,
     pub native_remove_field: RemoveFieldGasParameters,
+    pub native_list_field_keys: ListFieldsGasParameters,
 }
 
 impl GasParameters {
@@ -123,6 +130,7 @@ impl GasParameters {
             native_transfer_object: TransferObjectGasParameters::zeros(),
             native_to_shared_object: ToSharedObjectGasParameters::zeros(),
             native_to_frozen_object: ToFrozenObjectGasParameters::zeros(),
+            native_clear_fields: ClearFieldsGasParameters::zeros(),
             native_add_field: AddFieldGasParameters {
                 base: 0.into(),
                 per_byte_serialized: 0.into(),
@@ -143,111 +151,94 @@ impl GasParameters {
                 base: 0.into(),
                 per_byte_serialized: 0.into(),
             },
+            native_list_field_keys: ListFieldsGasParameters::zeros(),
         }
     }
 }
 
 pub fn make_all(gas_params: GasParameters) -> impl Iterator<Item = (String, NativeFunction)> {
-    let natives = [
+    let mut natives = [
         (
             "native_object_owner",
-            make_native_object_owner(
-                gas_params.common.clone(),
-                gas_params.native_object_meta.clone(),
-            ),
+            helpers::make_native(gas_params.clone(), native_object_owner),
         ),
         (
             "native_object_size",
-            make_native_object_size(
-                gas_params.common.clone(),
-                gas_params.native_object_meta.clone(),
-            ),
+            helpers::make_native(gas_params.clone(), native_object_size),
         ),
         (
             "native_object_flag",
-            make_native_object_flag(
-                gas_params.common.clone(),
-                gas_params.native_object_meta.clone(),
-            ),
+            helpers::make_native(gas_params.clone(), native_object_flag),
         ),
         (
             "native_object_created_at",
-            make_native_object_created_at(
-                gas_params.common.clone(),
-                gas_params.native_object_meta.clone(),
-            ),
+            helpers::make_native(gas_params.clone(), native_object_created_at),
         ),
         (
             "native_object_updated_at",
-            make_native_object_updated_at(gas_params.common.clone(), gas_params.native_object_meta),
+            helpers::make_native(gas_params.clone(), native_object_updated_at),
         ),
         (
             "native_borrow_object",
-            make_native_borrow_object(
-                gas_params.common.clone(),
-                gas_params.native_borrow_object.clone(),
-            ),
+            helpers::make_native(gas_params.clone(), native_borrow_object),
         ),
         (
             "native_borrow_mut_object",
-            make_native_borrow_object(gas_params.common.clone(), gas_params.native_borrow_object),
+            helpers::make_native(gas_params.clone(), native_borrow_object),
         ),
         (
             "native_take_object",
-            make_native_take_object(gas_params.common.clone(), gas_params.native_take_object),
+            helpers::make_native(gas_params.clone(), native_take_object),
         ),
         (
             "native_transfer_object",
-            make_native_transfer_object(
-                gas_params.common.clone(),
-                gas_params.native_transfer_object,
-            ),
+            helpers::make_native(gas_params.clone(), native_transfer_object),
         ),
         (
             "native_to_shared_object",
-            make_native_to_shared_object(
-                gas_params.common.clone(),
-                gas_params.native_to_shared_object,
-            ),
+            helpers::make_native(gas_params.clone(), native_to_shared_object),
         ),
         (
             "native_to_frozen_object",
-            make_native_to_frozen_object(
-                gas_params.common.clone(),
-                gas_params.native_to_frozen_object,
-            ),
+            helpers::make_native(gas_params.clone(), native_to_frozen_object),
+        ),
+        (
+            "native_clear_fields",
+            helpers::make_native(gas_params.clone(), native_clear_fields),
         ),
         (
             "native_add_field",
-            make_native_add_field(gas_params.common.clone(), gas_params.native_add_field),
+            helpers::make_native(gas_params.clone(), native_add_field),
         ),
         (
             "native_borrow_field",
-            make_native_borrow_field(
-                gas_params.common.clone(),
-                gas_params.native_borrow_field.clone(),
-            ),
+            helpers::make_native(gas_params.clone(), native_borrow_field),
         ),
         (
             "native_borrow_mut_field",
-            make_native_borrow_field(gas_params.common.clone(), gas_params.native_borrow_field),
+            helpers::make_native(gas_params.clone(), native_borrow_field),
         ),
         (
             "native_remove_field",
-            make_native_remove_field(gas_params.common.clone(), gas_params.native_remove_field),
+            helpers::make_native(gas_params.clone(), native_remove_field),
         ),
         (
             "native_contains_field",
-            make_native_contains_field(gas_params.common.clone(), gas_params.native_contains_field),
+            helpers::make_native(gas_params.clone(), native_contains_field),
         ),
         (
             "native_contains_field_with_value_type",
-            make_native_contains_field_with_value_type(
-                gas_params.common,
-                gas_params.native_contains_field_with_value_type,
-            ),
+            helpers::make_native(gas_params.clone(), native_contains_field_with_value_type),
         ),
-    ];
+    ]
+    .to_vec();
+
+    if !gas_params.clone().native_list_field_keys.is_empty() {
+        natives.push((
+            "native_list_field_keys",
+            helpers::make_native(gas_params.clone(), native_list_field_keys),
+        ));
+    }
 
     make_module_natives(natives)
 }

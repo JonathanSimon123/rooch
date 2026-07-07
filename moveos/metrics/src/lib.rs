@@ -4,6 +4,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(mismatched_lifetime_syntaxes)]
+
 use axum::{extract::Extension, http::StatusCode, routing::get, Router};
 use dashmap::DashMap;
 use std::future::Future;
@@ -27,6 +29,7 @@ pub mod histogram;
 pub mod metered_channel;
 pub mod monitored_mpsc;
 pub use guards::*;
+pub mod metrics_util;
 #[cfg(test)]
 mod tests;
 
@@ -135,18 +138,18 @@ macro_rules! monitored_future {
         };
 
         async move {
-            let metrics = mysten_metrics::get_metrics();
+            let metrics = metrics::get_metrics();
 
             let _metrics_guard = if let Some(m) = metrics {
                 m.$metric.with_label_values(&[location]).inc();
-                Some(mysten_metrics::scopeguard::guard(m, |metrics| {
+                Some(metrics::scopeguard::guard(m, |metrics| {
                     m.$metric.with_label_values(&[location]).dec();
                 }))
             } else {
                 None
             };
             let _logging_guard = if $logging_enabled {
-                Some(mysten_metrics::scopeguard::guard((), |_| {
+                Some(metrics::scopeguard::guard((), |_| {
                     tracing::event!(
                         tracing::Level::$logging_level,
                         "Future {} completed",
@@ -173,28 +176,22 @@ macro_rules! monitored_future {
 #[macro_export]
 macro_rules! spawn_monitored_task {
     ($fut: expr) => {
-        tokio::task::spawn(mysten_metrics::monitored_future!(
-            tasks, $fut, "", INFO, false
-        ))
+        tokio::task::spawn(metrics::monitored_future!(tasks, $fut, "", INFO, false))
     };
 }
 
 #[macro_export]
 macro_rules! spawn_logged_monitored_task {
     ($fut: expr) => {
-        tokio::task::spawn(mysten_metrics::monitored_future!(
-            tasks, $fut, "", INFO, true
-        ))
+        tokio::task::spawn(metrics::monitored_future!(tasks, $fut, "", INFO, true))
     };
 
     ($fut: expr, $name: expr) => {
-        tokio::task::spawn(mysten_metrics::monitored_future!(
-            tasks, $fut, $name, INFO, true
-        ))
+        tokio::task::spawn(metrics::monitored_future!(tasks, $fut, $name, INFO, true))
     };
 
     ($fut: expr, $name: expr, $logging_level: ident) => {
-        tokio::task::spawn(mysten_metrics::monitored_future!(
+        tokio::task::spawn(metrics::monitored_future!(
             tasks,
             $fut,
             $name,
@@ -341,6 +338,13 @@ impl RegistryService {
     }
 }
 
+impl Default for RegistryService {
+    fn default() -> Self {
+        let default_registry = Registry::new();
+        Self::new(default_registry)
+    }
+}
+
 /// Create a metric that measures the uptime from when this metric was constructed.
 /// The metric is labeled with:
 /// - 'process': the process type, differentiating between validator and fullnode
@@ -378,13 +382,6 @@ pub fn start_prometheus_server(addr: SocketAddr) -> RegistryService {
     let registry = Registry::new();
 
     let registry_service = RegistryService::new(registry);
-
-    if cfg!(msim) {
-        // prometheus uses difficult-to-support features such as TcpSocket::from_raw_fd(), so we
-        // can't yet run it in the simulator.
-        warn!("not starting prometheus server in simulator");
-        return registry_service;
-    }
 
     let app = Router::new()
         .route(METRICS_ROUTE, get(metrics))

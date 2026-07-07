@@ -1,20 +1,39 @@
 // Copyright (c) RoochNetwork
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::MoveOSStore;
+use crate::{MoveOSStore, StoreMeta};
 use anyhow::Result;
+use moveos_config::store_config::RocksdbConfig;
 use moveos_types::h256::H256;
 use moveos_types::test_utils::random_state_change_set;
+use raw_store::metrics::DBMetrics;
+use raw_store::rocks::RocksDB;
+use raw_store::StoreInstance;
 use smt::NodeReader;
 
 #[tokio::test]
-async fn test_reopen() {
+async fn test_reopen() -> Result<()> {
     let temp_dir = moveos_config::temp_dir();
+    let registry_service = metrics::RegistryService::default();
+    DBMetrics::init(&registry_service.default_registry());
 
     let key = H256::random();
     let node = b"testnode".to_vec();
     {
-        let moveos_store = MoveOSStore::new(temp_dir.path()).unwrap();
+        let db_metrics = DBMetrics::get_or_init(&registry_service.default_registry()).clone();
+        let store_instance = StoreInstance::new_db_instance(
+            RocksDB::new(
+                temp_dir.path(),
+                StoreMeta::get_column_family_names().to_vec(),
+                RocksdbConfig::default(),
+            )?,
+            db_metrics,
+        );
+        let moveos_store = MoveOSStore::new_with_instance(
+            store_instance.clone(),
+            &registry_service.default_registry(),
+        )
+        .unwrap();
         let node_store = moveos_store.get_state_node_store();
         node_store
             .put(key, node.clone())
@@ -23,10 +42,13 @@ async fn test_reopen() {
         assert_eq!(node_store.get(&key).unwrap(), Some(node.clone()));
     }
     {
-        let moveos_store = MoveOSStore::new(temp_dir.path()).unwrap();
+        // To aviod AlreadyReg for re open the same db
+        let new_registry = prometheus::Registry::new();
+        let moveos_store = MoveOSStore::new(temp_dir.path(), &new_registry).unwrap();
         let node_store = moveos_store.get_state_node_store();
         assert_eq!(node_store.get(&key).unwrap(), Some(node));
     }
+    Ok(())
 }
 
 #[tokio::test]

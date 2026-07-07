@@ -2,18 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::jsonrpc_types::account_view::BalanceInfoView;
-use crate::jsonrpc_types::address::RoochOrBitcoinAddressView;
-use crate::jsonrpc_types::event_view::{EventFilterView, IndexerEventIDView};
+use crate::jsonrpc_types::address::UnitedAddressView;
+use crate::jsonrpc_types::event_view::{EventFilterView, IndexerEventIDView, IndexerEventView};
+use crate::jsonrpc_types::field_view::FieldFilterView;
+use crate::jsonrpc_types::repair_view::{RepairIndexerParamsView, RepairIndexerTypeView};
 use crate::jsonrpc_types::transaction_view::{TransactionFilterView, TransactionWithInfoView};
 use crate::jsonrpc_types::{
     AccessPathView, AnnotatedFunctionResultView, BalanceInfoPageView, BytesView, EventOptions,
-    EventPageView, ExecuteTransactionResponseView, FieldKeyView, FunctionCallView, H256View,
-    IndexerEventPageView, IndexerObjectStatePageView, IndexerStateIDView, ModuleABIView,
+    EventPageView, ExecuteTransactionResponseView, FieldKeyView, FieldPageView, FunctionCallView,
+    H256View, IndexerEventPageView, IndexerObjectStatePageView, IndexerStateIDView, ModuleABIView,
     ObjectIDVecView, ObjectIDView, ObjectStateFilterView, ObjectStateView, QueryOptions,
-    RoochAddressView, StateOptions, StatePageView, StrView, StructTagView,
-    TransactionWithInfoPageView, TxOptions,
+    RoochAddressView, StateChangeSetPageView, StateOptions, StatePageView, StrView,
+    StructTagOrObjectIDView, StructTagView, SyncStateFilterView, TransactionWithInfoPageView,
+    TxOptions,
 };
+use crate::jsonrpc_types::{DryRunTransactionResponseView, Status};
 use crate::RpcResult;
+use jsonrpsee::core::SubscriptionResult;
 use jsonrpsee::proc_macros::rpc;
 use moveos_types::{access_path::AccessPath, state::FieldKey};
 use rooch_open_rpc_macros::open_rpc;
@@ -38,6 +43,9 @@ pub trait RoochAPI {
         tx_bcs_hex: BytesView,
         tx_option: Option<TxOptions>,
     ) -> RpcResult<ExecuteTransactionResponseView>;
+
+    #[method(name = "dryRunRawTransaction")]
+    async fn dry_run(&self, tx_bcs_hex: BytesView) -> RpcResult<DryRunTransactionResponseView>;
 
     /// Execute a read-only function call
     /// The function do not change the state of Application
@@ -104,11 +112,11 @@ pub trait RoochAPI {
             .await
     }
 
-    /// Get the events by event handle id
+    /// Get the events by event handle type or event handle id
     #[method(name = "getEventsByEventHandle")]
     async fn get_events_by_event_handle(
         &self,
-        event_handle_type: StructTagView,
+        event_handle: StructTagOrObjectIDView,
         cursor: Option<StrView<u64>>,
         limit: Option<StrView<u64>>,
         descending_order: Option<bool>,
@@ -133,7 +141,7 @@ pub trait RoochAPI {
     #[method(name = "getBalance")]
     async fn get_balance(
         &self,
-        account_addr: RoochOrBitcoinAddressView,
+        account_addr: UnitedAddressView,
         coin_type: StructTagView,
     ) -> RpcResult<BalanceInfoView>;
 
@@ -141,7 +149,7 @@ pub trait RoochAPI {
     #[method(name = "getBalances")]
     async fn get_balances(
         &self,
-        account_addr: RoochOrBitcoinAddressView,
+        account_addr: UnitedAddressView,
         cursor: Option<IndexerStateIDView>,
         limit: Option<StrView<u64>>,
     ) -> RpcResult<BalanceInfoPageView>;
@@ -186,4 +194,54 @@ pub trait RoochAPI {
         limit: Option<StrView<u64>>,
         query_option: Option<QueryOptions>,
     ) -> RpcResult<IndexerObjectStatePageView>;
+
+    /// Query the fields indexer by field filter
+    #[method(name = "queryFields")]
+    async fn query_fields(
+        &self,
+        filter: FieldFilterView,
+        page: Option<StrView<u64>>,
+        limit: Option<StrView<u64>>,
+        query_option: Option<QueryOptions>,
+    ) -> RpcResult<FieldPageView>;
+
+    /// Repair indexer by sync from states
+    #[method(name = "repairIndexer")]
+    async fn repair_indexer(
+        &self,
+        repair_type: RepairIndexerTypeView,
+        repair_params: RepairIndexerParamsView,
+    ) -> RpcResult<()>;
+
+    /// Sync state change sets
+    #[method(name = "syncStates")]
+    async fn sync_states(
+        &self,
+        filter: SyncStateFilterView,
+        // exclusive cursor if `Some`, otherwise start from the beginning
+        cursor: Option<StrView<u64>>,
+        limit: Option<StrView<u64>>,
+        query_option: Option<QueryOptions>,
+    ) -> RpcResult<StateChangeSetPageView>;
+
+    /// Get the chain and service status
+    #[method(name = "status")]
+    async fn status(&self) -> RpcResult<Status>;
+
+    /// Check change sets from sync states
+    #[method(name = "checkChangeSets")]
+    async fn check_change_set(
+        &self,
+        cursor: Option<StrView<u64>>,
+        limit: Option<StrView<u64>>,
+        query_option: Option<QueryOptions>,
+    ) -> RpcResult<Vec<u64>>;
+
+    /// Subscribe to a stream of event
+    #[subscription(name = "subscribeEvents", item = IndexerEventView)]
+    fn subscribe_events(&self, filter: EventFilterView) -> SubscriptionResult;
+
+    /// Subscribe to a stream of transaction with execution info
+    #[subscription(name = "subscribeTransactions", item = TransactionWithInfoView)]
+    fn subscribe_transactions(&self, filter: TransactionFilterView) -> SubscriptionResult;
 }

@@ -16,6 +16,7 @@ use std::path::PathBuf;
 pub const DEFAULT_EXPIRATION_SECS: u64 = 30;
 pub const ROOCH_DEV_NET_URL: &str = "https://dev-seed.rooch.network";
 pub const ROOCH_TEST_NET_URL: &str = "https://test-seed.rooch.network";
+pub const ROOCH_MAIN_NET_URL: &str = "https://main-seed.rooch.network";
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ClientConfig {
@@ -103,6 +104,14 @@ impl Env {
         }
     }
 
+    pub fn new_main_env() -> Self {
+        Self {
+            alias: BuiltinChainID::Main.chain_name(),
+            rpc: ROOCH_MAIN_NET_URL.into(),
+            ws: None,
+        }
+    }
+
     /// Guess the network based on the alias for some local use cases, do not want to connec to rpc.
     /// The right way to determine the network is to call the rpc `chain_id` method
     pub fn guess_network(&self) -> RoochNetwork {
@@ -119,7 +128,7 @@ impl Default for Env {
     fn default() -> Self {
         Env {
             alias: BuiltinChainID::Local.chain_name(),
-            rpc: ServerConfig::default().url(false),
+            rpc: format!("http://127.0.0.1:{}", ServerConfig::default().port),
             ws: None,
         }
     }

@@ -45,6 +45,10 @@ impl AccountKeystore for FileBasedKeystore {
         self.keystore.get_accounts(password)
     }
 
+    fn contains_address(&self, address: &RoochAddress) -> bool {
+        self.keystore.contains_address(address)
+    }
+
     fn add_address_encryption_data_to_keys(
         &mut self,
         address: RoochAddress,
@@ -102,7 +106,8 @@ impl AccountKeystore for FileBasedKeystore {
 
     fn addresses(&self) -> Vec<RoochAddress> {
         // Create an empty Vec to store the addresses.
-        let mut addresses = Vec::new();
+        let mut addresses =
+            Vec::with_capacity(self.keystore.keys.len() + self.keystore.session_keys.len());
 
         // Iterate over the `keys` and `session_keys` BTreeMaps.
         for key in self.keystore.keys.keys() {
@@ -134,6 +139,16 @@ impl AccountKeystore for FileBasedKeystore {
         self.keystore.binding_session_key(address, session_key)?;
         self.save()?;
         Ok(())
+    }
+
+    fn get_session_key(
+        &self,
+        address: &RoochAddress,
+        authentication_key: &AuthenticationKey,
+        password: Option<String>,
+    ) -> Result<Option<RoochKeyPair>, anyhow::Error> {
+        self.keystore
+            .get_session_key(address, authentication_key, password)
     }
 
     fn sign_transaction_via_session_key(

@@ -6,13 +6,7 @@ import { Bytes } from '../types/index.js'
 import { Address } from './address.js'
 import { RoochAddress } from './rooch.js'
 
-export abstract class ThirdPartyAddress implements Address {
-  protected readonly rawAddress: string
-
-  constructor(input: string) {
-    this.rawAddress = input
-  }
-
+export abstract class ThirdPartyAddress extends Address {
   abstract genMultiChainAddress(): Bytes
   abstract genRoochAddress(): RoochAddress
   abstract toBytes(): Bytes

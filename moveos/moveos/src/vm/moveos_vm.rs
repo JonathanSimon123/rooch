@@ -2,11 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::data_cache::{into_change_set, MoveosDataCache};
-use crate::gas::table::ClassifiedGasMeter;
-use crate::gas::SwitchableGasMeter;
 use move_binary_format::compatibility::Compatibility;
 use move_binary_format::file_format::CompiledScript;
-use move_binary_format::normalized;
 use move_binary_format::{
     access::ModuleAccess,
     errors::{verification_error, Location, PartialVMError, PartialVMResult, VMError, VMResult},
@@ -31,10 +28,12 @@ use move_vm_runtime::{
 };
 use move_vm_types::gas::UnmeteredGasMeter;
 use move_vm_types::loaded_data::runtime_types::{CachedStructIndex, StructType, Type};
+use moveos_common::types::{ClassifiedGasMeter, SwitchableGasMeter};
 use moveos_object_runtime::runtime::{ObjectRuntime, ObjectRuntimeContext};
 use moveos_stdlib::natives::moveos_stdlib::{
     event::NativeEventContext, move_module::NativeModuleContext,
 };
+use moveos_store::load_feature_store_object;
 use moveos_types::state::ObjectState;
 use moveos_types::{addresses, transaction::RawTransactionOutput};
 use moveos_types::{
@@ -126,6 +125,10 @@ impl MoveOSVM {
     pub fn mark_loader_cache_as_invalid(&self) {
         self.inner.mark_loader_cache_as_invalid()
     }
+
+    pub fn inner(&self) -> &MoveVM {
+        &self.inner
+    }
 }
 
 /// MoveOSSession is a wrapper of MoveVM session with MoveOS specific features.
@@ -184,7 +187,11 @@ where
     ) -> Session<'r, 'l, MoveosDataCache<'r, 'l, S>> {
         let mut extensions = NativeContextExtensions::default();
 
-        extensions.add(ObjectRuntimeContext::new(object_runtime.clone()));
+        let feature_store = load_feature_store_object(remote);
+        extensions.add(ObjectRuntimeContext::new(
+            object_runtime.clone(),
+            feature_store,
+        ));
         extensions.add(NativeModuleContext::new(remote));
         extensions.add(NativeEventContext::default());
 
@@ -214,8 +221,8 @@ where
                 let location = Location::Script;
                 moveos_verifier::verifier::verify_entry_function(&loaded_function, &self.session)
                     .map_err(|e| e.finish(location.clone()))?;
-                let _resolved_args =
-                    self.resolve_argument(&loaded_function, call.args.clone(), location)?;
+                let _serialized_args =
+                    self.resolve_argument(&loaded_function, call.args.clone(), location, false)?;
 
                 let compiled_script_opt = CompiledScript::deserialize(call.code.as_slice());
                 let compiled_script = match compiled_script_opt {
@@ -242,7 +249,7 @@ where
                 moveos_verifier::verifier::verify_entry_function(&loaded_function, &self.session)
                     .map_err(|e| e.finish(location.clone()))?;
                 let _resolved_args =
-                    self.resolve_argument(&loaded_function, call.args.clone(), location)?;
+                    self.resolve_argument(&loaded_function, call.args.clone(), location, false)?;
                 Ok(VerifiedMoveAction::Function {
                     call,
                     bypass_visibility: false,
@@ -259,6 +266,13 @@ where
                 };
                 let compiled_modules = deserialize_modules(&module_bundle)?;
 
+                let result =
+                    moveos_verifier::verifier::verify_modules(&compiled_modules, self.remote);
+                match result {
+                    Ok(_) => {}
+                    Err(err) => return Err(err),
+                }
+
                 self.vm
                     .runtime
                     .loader()
@@ -268,13 +282,6 @@ where
                     )?;
 
                 let mut init_function_modules = vec![];
-
-                let result =
-                    moveos_verifier::verifier::verify_modules(&compiled_modules, self.remote);
-                match result {
-                    Ok(_) => {}
-                    Err(err) => return Err(err),
-                }
 
                 for module in &compiled_modules {
                     let result = moveos_verifier::verifier::verify_init_function(module);
@@ -300,15 +307,15 @@ where
     /// The caller should ensure call verify_move_action before execute.
     /// Once we start executing transactions, we must ensure that the transaction execution has a result, regardless of success or failure,
     /// and we need to save the result and deduct gas
-    pub(crate) fn execute_move_action(&mut self, action: VerifiedMoveAction) -> VMResult<()> {
+    pub fn execute_move_action(&mut self, action: VerifiedMoveAction) -> VMResult<()> {
         let action_result = match action {
             VerifiedMoveAction::Script { call } => {
                 let loaded_function = self
                     .session
                     .load_script(call.code.as_slice(), call.ty_args.clone())?;
                 let location: Location = Location::Script;
-                let resolved_args = self.resolve_argument(&loaded_function, call.args, location)?;
-                let serialized_args = self.load_arguments(resolved_args)?;
+                let serialized_args =
+                    self.resolve_argument(&loaded_function, call.args, location, true)?;
                 self.session
                     .execute_script(
                         call.code,
@@ -333,8 +340,8 @@ where
                     call.ty_args.as_slice(),
                 )?;
                 let location = Location::Module(call.function_id.module_id.clone());
-                let resolved_args = self.resolve_argument(&loaded_function, call.args, location)?;
-                let serialized_args = self.load_arguments(resolved_args)?;
+                let serialized_args =
+                    self.resolve_argument(&loaded_function, call.args, location, true)?;
                 if bypass_visibility {
                     // bypass visibility call is system call, such as execute L1 block transaction
                     self.session
@@ -432,10 +439,8 @@ where
 
                     if data_store.exists_module(&module_id)? && compat.need_check_compat() {
                         let old_module = self.vm.load_module(&module_id, &self.remote)?;
-                        let old_m = normalized::Module::new(old_module.as_ref());
-                        let new_m = normalized::Module::new(module);
                         compat
-                            .check(&old_m, &new_m)
+                            .check(&old_module, module)
                             .map_err(|e| e.finish(Location::Undefined))?;
                     }
                     if !bundle_unverified.insert(module_id) {
@@ -464,18 +469,20 @@ where
             }
         };
 
-        self.resolve_pending_init_functions()?;
+        if action_result.is_ok() {
+            self.resolve_pending_init_functions()?;
+            // Check if there are modules upgrading
+            let module_flag = self.tx_context().get::<ModuleUpgradeFlag>().map_err(|e| {
+                PartialVMError::new(StatusCode::UNKNOWN_VALIDATION_STATUS)
+                    .with_message(e.to_string())
+                    .finish(Location::Undefined)
+            })?;
+            let is_upgrade = module_flag.map_or(false, |flag| flag.is_upgrade);
+            if is_upgrade {
+                self.vm.mark_loader_cache_as_invalid();
+            };
+        }
 
-        // Check if there are modules upgrading
-        let module_flag = self.tx_context().get::<ModuleUpgradeFlag>().map_err(|e| {
-            PartialVMError::new(StatusCode::UNKNOWN_VALIDATION_STATUS)
-                .with_message(e.to_string())
-                .finish(Location::Undefined)
-        })?;
-        let is_upgrade = module_flag.map_or(false, |flag| flag.is_upgrade);
-        if is_upgrade {
-            self.vm.mark_loader_cache_as_invalid();
-        };
         action_result
     }
 
@@ -486,6 +493,12 @@ where
             .get_native_extensions_mut()
             .get_mut::<NativeModuleContext>();
         let init_functions = ctx.init_functions.clone();
+
+        // Since object_runtime does not update promptly when a new module is published
+        // it is necessary to clear the module_cache.
+        self.vm.mark_loader_cache_as_invalid();
+        self.vm.flush_loader_cache_if_invalidated();
+
         if !init_functions.is_empty() {
             self.execute_init_modules(init_functions.into_iter().collect())
         } else {
@@ -503,8 +516,7 @@ where
             call.ty_args.as_slice(),
         )?;
         let location = Location::Module(call.function_id.module_id.clone());
-        let resolved_args = self.resolve_argument(&loaded_function, call.args, location)?;
-        let serialized_args = self.load_arguments(resolved_args)?;
+        let serialized_args = self.resolve_argument(&loaded_function, call.args, location, true)?;
         let return_values = self.session.execute_function_bypass_visibility(
             &call.function_id.module_id,
             &call.function_id.function_name,
@@ -541,8 +553,8 @@ where
         for module_id in init_function_modules {
             let function_id = FunctionId::new(module_id.clone(), INIT_FN_NAME_IDENTIFIER.clone());
             let call = FunctionCall::new(function_id, vec![], vec![]);
-            if log::log_enabled!(log::Level::Trace) {
-                log::trace!(
+            if tracing::enabled!(tracing::Level::TRACE) {
+                tracing::trace!(
                     "Execute init function for module: {:?}",
                     module_id.to_string()
                 );
@@ -606,8 +618,13 @@ where
         let events: Vec<_> = raw_events
             .into_iter()
             .enumerate()
-            .map(|(i, (struct_tag, event_data))| {
-                Ok(TransactionEvent::new(struct_tag, event_data, i as u64))
+            .map(|(i, (struct_tag, event_handle_id, event_data))| {
+                Ok(TransactionEvent::new_with_handle(
+                    struct_tag,
+                    event_data,
+                    i as u64,
+                    event_handle_id,
+                ))
             })
             .collect::<VMResult<_>>()?;
 
@@ -664,11 +681,12 @@ where
                 events,
                 gas_used,
                 is_upgrade,
+                is_gas_upgrade: false,
             },
         ))
     }
 
-    pub(crate) fn execute_function_call(
+    pub fn execute_function_call(
         &mut self,
         functions: Vec<FunctionCall>,
         meter_gas: bool,

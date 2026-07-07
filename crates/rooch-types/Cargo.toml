@@ -25,36 +25,34 @@ hex = { workspace = true }
 once_cell = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
-smt = { workspace = true }
 serde = { workspace = true }
-serde_bytes = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true }
 serde_yaml = { workspace = true }
 derive_more = { workspace = true }
 eyre = { workspace = true }
 fastcrypto = { workspace = true, features = ["copy_key"] }
-schemars = {workspace = true }
+schemars = { workspace = true }
 strum = { workspace = true }
 strum_macros = { workspace = true }
-async-trait ={ workspace = true }
-nostr = { workspace = true }
 clap = { workspace = true }
 sha3 = { workspace = true }
 bs58 = { workspace = true, features = ["check"] }
 chacha20poly1305 = { workspace = true }
 argon2 = { workspace = true }
+tracing = { workspace = true }
+xxhash-rust = { workspace = true, features = ["xxh3"] }
+lz4 = { workspace = true }
+coerce = { workspace = true }
+multibase = { workspace = true }
 
 move-core-types = { workspace = true }
 move-vm-types = { workspace = true }
-move-stdlib = { workspace = true }
 move-command-line-common = { workspace = true }
 move-binary-format = { workspace = true }
 move-resource-viewer = { workspace = true }
 
 moveos-types = { workspace = true }
-moveos-stdlib = { workspace = true }
-moveos = { workspace = true }
 accumulator = { workspace = true }
 
 framework-builder = { workspace = true }
@@ -62,6 +60,7 @@ framework-types = { workspace = true }
 
 proptest = { optional = true, workspace = true }
 proptest-derive = { optional = true, workspace = true }
+
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -73,3 +72,6 @@ fuzzing = [
     "proptest",
     "proptest-derive",
 ]
+
+[package.metadata.cargo-machete]
+ignored = ["strum"]

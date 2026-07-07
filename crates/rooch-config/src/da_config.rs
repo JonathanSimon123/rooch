@@ -2,70 +2,190 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::config::Config;
-use crate::config::{parse_hashmap, retrieve_map_config_value, MapConfigValueSource};
-use crate::BaseConfig;
-use clap::Parser;
-use once_cell::sync::Lazy;
+use crate::{retrieve_map_config_value, BaseConfig, MapConfigValueSource};
+use moveos_types::h256::H256;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-static R_DEFAULT_OPENDA_FS_DIR: Lazy<PathBuf> = Lazy::new(|| PathBuf::from("openda_fs"));
+const DA_NAMESPACE_FROM_GENESIS_LENGTH: usize = 8;
+const DEFAULT_OPENDA_FS_DIR: &str = "openda-fs";
+// Default background submit interval: 5 seconds
+// a smaller interval helps to reduce the delay of blocks-making and submitting.
+//
+// After the first background submit job which, the cursor will be updated to the last submitted block number.
+// Only a few database operations are needed to catch up with the latest block numbers after a restart,
+// so it's okay to have a small interval.
+pub const DEFAULT_DA_BACKGROUND_SUBMIT_INTERVAL: u64 = 15;
 
+/// This enum specifies the strategy for submitting DA data.
+///
+/// `All` means all backends must submit.
+/// `Quorum` means a majority (>= n/2+1) must submit.
+/// `Number(n)` means at least `n` backends must submit.
+///
+/// No matter what the strategy is, an independent process will sync all the data to all backends.
+/// Eventual consistency is guaranteed.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub enum DAServerSubmitStrategy {
+pub enum DASubmitStrategy {
     All,
-    // >= n/2+1
     Quorum,
-    // >= number
     Number(usize),
 }
 
+impl FromStr for DASubmitStrategy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "all" => Ok(DASubmitStrategy::All),
+            "quorum" => Ok(DASubmitStrategy::Quorum),
+            _ => {
+                if let Ok(n) = s.parse::<usize>() {
+                    Ok(DASubmitStrategy::Number(n))
+                } else {
+                    Err(format!("invalid da submit strategy: {}", s))
+                }
+            }
+        }
+    }
+}
+
+impl Display for DASubmitStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DASubmitStrategy::All => write!(f, "all"),
+            DASubmitStrategy::Quorum => write!(f, "quorum"),
+            DASubmitStrategy::Number(n) => write!(f, "{}", n),
+        }
+    }
+}
+
+/// Represents the available Open-DA schemes supported by the backend.
+///
+/// Each enum variant corresponds to a specific backend type and its respective configuration.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OpenDAScheme {
-    // local filesystem, for developing only, config:
-    // root: file path to the root directory
+    /// Local file system backend.
+    ///
+    /// Main configuration:
+    /// - `root`: The root file path for storing data files.
     #[default]
     Fs,
-    // gcs(Google Could Service) main config:
-    // bucket
-    // root
-    // credential （it's okay to pass credential file path here, it'll be handled it automatically）
+
+    /// Google Cloud Storage (GCS) backend.
+    ///
+    /// Main configuration:
+    /// - `bucket`: The storage bucket.
+    /// - `credential`: The authentication credential (or `credential_path`, using a file path).
     Gcs,
-    // s3 config:
-    // root
-    // bucket
-    // region
-    // endpoint
-    // access_key_id
-    // secret_access_key
+
+    /// Amazon S3-compatible backend.
+    ///
+    /// Main configuration:
+    /// - `bucket`: The storage bucket.
+    /// - `region`: The AWS region.
+    /// - `endpoint`: The S3 endpoint URL.
+    /// - `access_key_id`: The AWS access key ID.
+    /// - `secret_access_key`: The AWS secret access key.
     S3,
+
+    /// Avail Fusion backend, supporting TurboDA and Light Client.
+    ///
+    /// Main configuration:
+    /// - `turbo_endpoint`: The TurboDA service endpoint.
+    /// - `turbo_api_key`: The x-api-key for TurboDA.
+    /// - `light_endpoint`: The Light Client service endpoint.
+    Avail,
+
+    /// Celestia backend.
+    ///
+    /// Main configuration:
+    /// - `endpoint`: The Celestia service endpoint.
+    /// - `auth_token` (optional): The authentication token for accessing the Celestia backend.
+    Celestia,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum InternalDAServerConfigType {
-    Celestia(DAServerCelestiaConfig),
-    OpenDa(DAServerOpenDAConfig),
+impl Display for OpenDAScheme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpenDAScheme::Fs => write!(f, "fs"),
+            OpenDAScheme::Gcs => write!(f, "gcs"),
+            OpenDAScheme::S3 => write!(f, "s3"),
+            OpenDAScheme::Avail => write!(f, "avail"),
+            OpenDAScheme::Celestia => write!(f, "celestia"),
+        }
+    }
 }
 
-#[derive(Clone, Default, Debug, PartialEq, Deserialize, Serialize, Parser)]
+impl FromStr for OpenDAScheme {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "gcs" => Ok(OpenDAScheme::Gcs),
+            "s3" => Ok(OpenDAScheme::S3),
+            "fs" => Ok(OpenDAScheme::Fs),
+            "avail" => Ok(OpenDAScheme::Avail),
+            "celestia" => Ok(OpenDAScheme::Celestia),
+            _ => Err("open-da scheme no match"),
+        }
+    }
+}
+
+// OpenDAScheme to OpenDALScheme
+impl From<OpenDAScheme> for opendal::Scheme {
+    fn from(scheme: OpenDAScheme) -> Self {
+        match scheme {
+            OpenDAScheme::Fs => opendal::Scheme::Fs,
+            OpenDAScheme::Gcs => opendal::Scheme::Gcs,
+            OpenDAScheme::S3 => opendal::Scheme::S3,
+            OpenDAScheme::Avail => opendal::Scheme::Custom("avail"),
+            OpenDAScheme::Celestia => opendal::Scheme::Custom("celestia"),
+        }
+    }
+}
+
+/// Configuration for Data Availability (DA).
+///
+/// This struct controls how the node interacts with DA backends and specifies the starting point
+/// for submitting blocks to DA. It balances flexibility, efficiency, and clarity while ensuring
+/// compatibility with other configuration components.
+#[derive(Clone, Default, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "kebab-case")]
 pub struct DAConfig {
+    /// Specifies the configuration for the DA backends.
+    ///
+    /// This contains details about the backends used to ensure data availability,
+    /// such as their types and additional configuration options. If not set, no DA
+    /// backends will be used.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[clap(name = "internal-da-server", long, help = "internal da server config")]
-    pub internal_da_server: Option<InternalDAServerConfig>,
+    pub da_backend: Option<DABackendConfig>,
+
+    /// The first block to be submitted to the DA.
+    ///
+    /// If left unset, all blocks will be submitted starting from the genesis block.
+    /// This allows flexibility in choosing whether to submit old blocks or just newly
+    /// created ones.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub da_min_block_to_submit: Option<u128>,
+    /// Specifies the interval for background submission in seconds.
+    /// If not set, the default value is `DEFAULT_DA_BACKGROUND_SUBMIT_INTERVAL`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background_submit_interval: Option<u64>,
+
+    /// Internal reference to the base configuration.
+    ///
+    /// This is used internally by the node to access basic configuration details
+    /// (e.g., data directories) and is initialized when the configuration is loaded.
     #[serde(skip)]
-    #[clap(skip)]
     base: Option<Arc<BaseConfig>>,
-    // TODO external da server config
 }
 
 impl Display for DAConfig {
@@ -94,22 +214,41 @@ impl DAConfig {
     pub(crate) fn init(&mut self, base: Arc<BaseConfig>) -> anyhow::Result<()> {
         self.base = Some(base);
 
+        self.background_submit_interval
+            .get_or_insert(DEFAULT_DA_BACKGROUND_SUBMIT_INTERVAL);
+
         let default_fs_root = self.get_openda_fs_dir();
 
-        if let Some(InternalDAServerConfig { servers, .. }) = &mut self.internal_da_server {
-            for server in servers {
-                if let InternalDAServerConfigType::OpenDa(open_da_config) = server {
+        if let Some(da_backend_cfg) = &mut self.da_backend {
+            let backends_configs = &mut da_backend_cfg.backends;
+            for backend_config in backends_configs {
+                #[allow(irrefutable_let_patterns)]
+                if let DABackendConfigType::OpenDa(open_da_config) = backend_config {
                     if matches!(open_da_config.scheme, OpenDAScheme::Fs) {
-                        let var_source = retrieve_map_config_value(
-                            &mut open_da_config.config,
-                            "root",
-                            None,
-                            default_fs_root.to_str().unwrap(),
-                        );
-                        if let MapConfigValueSource::Default = var_source {
-                            if !default_fs_root.exists() {
-                                std::fs::create_dir_all(default_fs_root.clone())?;
+                        if let Some(fs_str) = default_fs_root.to_str() {
+                            let var_source = retrieve_map_config_value(
+                                &mut open_da_config.config,
+                                "root",
+                                None,
+                                Some(fs_str),
+                            );
+                            if let MapConfigValueSource::Default = var_source {
+                                if !default_fs_root.exists() {
+                                    std::fs::create_dir_all(default_fs_root.clone()).map_err(
+                                        |e| {
+                                            anyhow::anyhow!(
+                                                "Failed to create OpenDA fs dir: {:?}",
+                                                e
+                                            )
+                                        },
+                                    )?;
+                                }
                             }
+                        } else {
+                            return Err(anyhow::anyhow!(
+                                "Invalid UTF-8 path: {:?}",
+                                default_fs_root
+                            ));
                         }
                     }
                 }
@@ -128,214 +267,132 @@ impl DAConfig {
     }
 
     pub fn get_openda_fs_dir(&self) -> PathBuf {
-        self.data_dir().join(R_DEFAULT_OPENDA_FS_DIR.as_path())
+        self.data_dir().join(DEFAULT_OPENDA_FS_DIR)
     }
 }
 
-#[derive(Clone, Default, Debug, PartialEq, Deserialize, Serialize, Parser)]
+/// Configuration for DA (Data Availability) backends.
+///
+/// This struct defines how the node interacts with different DA backends,
+/// including their types and the strategy used for submitting data to them.
+#[derive(Clone, Default, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
 #[serde(deny_unknown_fields)]
-pub struct InternalDAServerConfig {
+pub struct DABackendConfig {
+    /// Configures the submission strategy for DA operations.
+    ///
+    /// This option defines how many backends are required to successfully process data submissions:
+    /// - `All`: All backends must successfully submit the data.
+    /// - `Quorum`: A majority (>= n/2 + 1) of backends must submit.
+    /// - `Number(n)`: At least `n` backends must submit.
+    ///
+    /// If not set, the default behavior is equivalent to requiring `All`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[clap(
-        name = "submit-strategy",
-        long,
-        help = "specifies the submission strategy of internal DA servers to be used. 'all' with all servers, 'quorum' with quorum servers, 'n' with n servers, etc."
-    )]
-    pub submit_strategy: Option<DAServerSubmitStrategy>,
-    #[clap(
-        name = "servers",
-        long,
-        help = "specifies the type of internal DA servers to be used. 'celestia' with corresponding Celestia server configuration, 'xxx' with corresponding xxx server configuration, etc."
-    )]
-    pub servers: Vec<InternalDAServerConfigType>,
+    pub submit_strategy: Option<DASubmitStrategy>,
+
+    /// Specifies the types of DA backends to be used.
+    ///
+    /// Each backend entry corresponds to a specific configuration.
+    /// For example,
+    /// - `OpenDA`: Configured for access to storage solutions like S3, GCS, etc.
+    /// - Additional backend types can extend this field as the system grows.
+    pub backends: Vec<DABackendConfigType>,
 }
 
-impl InternalDAServerConfig {
-    pub fn adjust_submit_strategy(&mut self) {
-        let servers_count = self.servers.len();
-
-        // Set default strategy to All if it's None.
-        let strategy = self
-            .submit_strategy
-            .get_or_insert(DAServerSubmitStrategy::All);
-
-        // If it's a Number, adjust the value to be within [1, n].
-        if let DAServerSubmitStrategy::Number(ref mut num) = strategy {
-            *num = std::cmp::max(1, std::cmp::min(*num, servers_count));
-        }
-    }
+impl DABackendConfig {
+    const DEFAULT_SUBMIT_STRATEGY: DASubmitStrategy = DASubmitStrategy::All;
 
     pub fn calculate_submit_threshold(&mut self) -> usize {
         self.adjust_submit_strategy(); // Make sure submit_strategy is adjusted before calling this function.
 
-        let servers_count = self.servers.len();
+        let backends_count = self.backends.len();
         match self.submit_strategy {
-            Some(DAServerSubmitStrategy::All) => servers_count,
-            Some(DAServerSubmitStrategy::Quorum) => servers_count / 2 + 1,
-            Some(DAServerSubmitStrategy::Number(number)) => number,
-            None => servers_count, // Default to 'All' if submit_strategy is None
+            Some(DASubmitStrategy::All) => backends_count,
+            Some(DASubmitStrategy::Quorum) => backends_count / 2 + 1,
+            Some(DASubmitStrategy::Number(number)) => number,
+            None => 1, // Default to 1
+        }
+    }
+
+    fn adjust_submit_strategy(&mut self) {
+        let strategy = self
+            .submit_strategy
+            .get_or_insert(Self::DEFAULT_SUBMIT_STRATEGY);
+
+        let backends_count = self.backends.len();
+
+        // If it's Number, adjust the value to be within [1, n].
+        if let DASubmitStrategy::Number(ref mut num) = strategy {
+            *num = std::cmp::max(1, std::cmp::min(*num, backends_count));
         }
     }
 }
 
-impl FromStr for InternalDAServerConfig {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let deserialized = serde_json::from_str(s)?;
-        Ok(deserialized)
-    }
+/// Represents the type of DA (Data Availability) backend configuration.
+///
+/// Each variant corresponds to a specific backend type and its associated configuration.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DABackendConfigType {
+    /// OpenDA backend configuration.
+    ///
+    /// This variant contains the configuration specific to OpenDA, enabling access
+    /// to various storage backends (e.g., Avail, Celestia, S3, GCS, etc.).
+    OpenDa(DABackendOpenDAConfig),
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Parser)]
+/// Configuration for the Open DA backend.
+///
+/// Open DA provides the ability to interact with various backend implementations.
+/// Each backend is defined by its unique configuration options.
+#[derive(Clone, Default, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
 #[serde(deny_unknown_fields)]
-pub struct DAServerCelestiaConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[clap(name = "namespace", long, help = "celestia namespace")]
-    pub namespace: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[clap(name = "conn", long, help = "celestia node connection")]
-    pub conn: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[clap(name = "auth-token", long, help = "celestia node auth token")]
-    pub auth_token: Option<String>,
-    // for celestia:
-    // support for up to 8 MB blocks, starting with 2MB at genesis and upgradeable through onchain governance.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[clap(
-        name = "max-segment-size",
-        long,
-        help = "max segment size, striking a balance between throughput and the constraints on blob size."
-    )]
-    pub max_segment_size: Option<u64>,
-}
-
-impl Default for DAServerCelestiaConfig {
-    fn default() -> Self {
-        Self {
-            namespace: None,
-            conn: None,
-            auth_token: None,
-            max_segment_size: Some(1024 * 1024),
-        }
-    }
-}
-
-impl DAServerCelestiaConfig {
-    pub fn new_with_defaults(mut self) -> Self {
-        let default = DAServerCelestiaConfig::default();
-        if self.max_segment_size.is_none() {
-            self.max_segment_size = default.max_segment_size;
-        }
-        self
-    }
-}
-
-impl FromStr for InternalDAServerConfigType {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let v: Value =
-            serde_json::from_str(s).map_err(|e| format!("Error parsing JSON: {}, {}", e, s))?;
-
-        if let Some(obj) = v.as_object() {
-            if let Some(celestia) = obj.get("celestia") {
-                let celestia_config: DAServerCelestiaConfig =
-                    serde_json::from_value(celestia.clone()).map_err(|e| {
-                        format!(
-                            "invalid celestia config: {} error: {}, original: {}",
-                            celestia, e, s
-                        )
-                    })?;
-                Ok(InternalDAServerConfigType::Celestia(celestia_config))
-            } else if let Some(openda) = obj.get("open-da") {
-                let openda_config: DAServerOpenDAConfig = serde_json::from_value(openda.clone())
-                    .map_err(|e| {
-                        format!(
-                            "invalid open-da config: {}, error: {}, original: {}",
-                            openda, e, s
-                        )
-                    })?;
-                Ok(InternalDAServerConfigType::OpenDa(openda_config))
-            } else {
-                Err(format!("Invalid value: {}", s))
-            }
-        } else {
-            Err(format!("Invalid value: {}", s))
-        }
-    }
-}
-
-// Open DA provides ability to access various storage services
-#[derive(Clone, Default, Debug, PartialEq, Deserialize, Serialize, Parser)]
-#[serde(deny_unknown_fields)]
-pub struct DAServerOpenDAConfig {
-    #[clap(
-        name = "scheme",
-        long,
-        value_enum,
-        default_value = "fs",
-        help = "specifies the type of storage service to be used. 'gcs' with corresponding GCS server configuration, 's3' with corresponding S3 server configuration, etc."
-    )]
+pub struct DABackendOpenDAConfig {
+    /// Specifies the type of backend to be used.
+    /// The `scheme` informs the backend logic on how to handle the associated configuration.
     #[serde(default)]
     pub scheme: OpenDAScheme,
-    #[clap(
-    name = "config",
-    long,
-    value_parser = parse_hashmap,
-    help = "specifies the configuration of the storage service. 'gcs' with corresponding GCS server configuration, 's3' with corresponding S3 server configuration, etc."
-    )]
-    #[serde(default)]
+
+    /// Specifies the detailed configuration for the selected backend.
     pub config: HashMap<String, String>,
 
+    /// Specifies the namespace for data storage, depending on the backend.
+    ///
+    /// - **Filesystem-like backends** (e.g., S3, GCS, local filesystem):
+    ///   - The path is structured as `<namespace>/<segment_id>` to store the segment.
+    ///   - If not set:
+    ///     - `<derive_genesis_namespace>/<segment_id>` is used as the full path.
+    ///     - If the `root` field is set in the `config`, the full path becomes `<root>/<namespace>/<segment_id>`.
+    /// - **Celestia**:
+    ///   - The namespace must already exist and is specified directly in hexadecimal format.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[clap(
-        name = "max-segment-size",
-        long,
-        help = "max segment size, striking a balance between throughput and the constraints on blob size."
-    )]
+    pub namespace: Option<String>,
+
+    /// Specifies the maximum segment size (in bytes).
+    ///
+    /// - If not set, the backend implementation will use its default value.
+    /// - This helps determine the maximum allowed size for data segments.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_segment_size: Option<u64>,
+
+    /// Specifies the maximum number of retry attempts for failed segment submissions.
+    ///
+    /// - If not set, the backend implementation will determine the default number of retries.
+    /// - This configuration can help fine-tune the reliability of segment submission in case of transient errors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<usize>,
 }
 
-impl FromStr for DAServerSubmitStrategy {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "all" => Ok(DAServerSubmitStrategy::All),
-            "quorum" => Ok(DAServerSubmitStrategy::Quorum),
-            _ => {
-                if let Ok(n) = s.parse::<usize>() {
-                    Ok(DAServerSubmitStrategy::Number(n))
-                } else {
-                    Err(format!("invalid da server submit strategy: {}", s))
-                }
-            }
-        }
-    }
-}
-
-impl Display for OpenDAScheme {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OpenDAScheme::Fs => write!(f, "fs"),
-            OpenDAScheme::Gcs => write!(f, "gcs"),
-            OpenDAScheme::S3 => write!(f, "s3"),
-        }
-    }
-}
-
-impl FromStr for OpenDAScheme {
-    type Err = &'static str;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "gcs" => Ok(OpenDAScheme::Gcs),
-            "s3" => Ok(OpenDAScheme::S3),
-            "fs" => Ok(OpenDAScheme::Fs),
-            _ => Err("open-da scheme no match"),
-        }
-    }
+/// Derives a namespace from the genesis hash for the DA backend.
+/// The resulting namespace is generated by taking the first NAMESPACE_LENGTH hexadecimal characters
+/// of the genesis_hash.
+pub fn derive_namespace_from_genesis(genesis_hash: H256) -> String {
+    let encoded_hash = hex::encode(genesis_hash.0);
+    encoded_hash
+        .chars()
+        .take(DA_NAMESPACE_FROM_GENESIS_LENGTH)
+        .collect()
 }
 
 #[cfg(test)]
@@ -343,115 +400,180 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_adjust_submit_strategy_default_to_all() {
-        let mut config = InternalDAServerConfig {
-            submit_strategy: None,
-            servers: vec![], // Empty for this test
+    fn calculate_submit_threshold() {
+        let mut da_backend_config = DABackendConfig {
+            submit_strategy: Some(DASubmitStrategy::All),
+            backends: vec![
+                DABackendConfigType::OpenDa(DABackendOpenDAConfig {
+                    scheme: OpenDAScheme::Fs,
+                    config: HashMap::new(),
+                    namespace: None,
+                    max_segment_size: None,
+                    max_retries: None,
+                }),
+                DABackendConfigType::OpenDa(DABackendOpenDAConfig {
+                    scheme: OpenDAScheme::Fs,
+                    config: HashMap::new(),
+                    namespace: None,
+                    max_segment_size: None,
+                    max_retries: None,
+                }),
+            ],
         };
-        config.adjust_submit_strategy();
-        assert_eq!(config.submit_strategy, Some(DAServerSubmitStrategy::All));
+        assert_eq!(da_backend_config.calculate_submit_threshold(), 2);
+
+        da_backend_config.submit_strategy = Some(DASubmitStrategy::Quorum);
+        assert_eq!(da_backend_config.calculate_submit_threshold(), 2);
+
+        da_backend_config.submit_strategy = Some(DASubmitStrategy::Number(1));
+        assert_eq!(da_backend_config.calculate_submit_threshold(), 1);
+
+        da_backend_config.submit_strategy = Some(DASubmitStrategy::Number(3));
+        assert_eq!(da_backend_config.calculate_submit_threshold(), 2);
+
+        da_backend_config.submit_strategy = None;
+        assert_eq!(da_backend_config.calculate_submit_threshold(), 2);
     }
 
     #[test]
-    fn test_adjust_submit_strategy_number_too_low() {
-        let mut config = InternalDAServerConfig {
-            submit_strategy: Some(DAServerSubmitStrategy::Number(0)),
-            servers: vec![
-                InternalDAServerConfigType::Celestia(DAServerCelestiaConfig::default());
-                2
-            ], // Two servers for this test
+    fn da_config_from_str() {
+        let da_config_str = r#"{"da-backend": {"submit-strategy": "all",
+        "backends": [{"open-da": {"scheme": "gcs", "config": {"bucket": "test-bucket", "credential": "test-credential"}}},
+        {"open-da": {"scheme": "celestia", "config": {"endpoint": "test-conn", "auth_token": "test-auth"}, "namespace": "000000000000000000000000000000000000000102030405060708090a"}},
+        {"open-da": {"scheme": "fs", "config": {}}}]}, "da-min-block-to-submit": 340282366920938463463374607431768211455}"#;
+
+        let exp_gcs_config = DABackendOpenDAConfig {
+            scheme: OpenDAScheme::Gcs,
+            config: vec![
+                ("bucket".to_string(), "test-bucket".to_string()),
+                ("credential".to_string(), "test-credential".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            namespace: None,
+            max_segment_size: None,
+            max_retries: None,
         };
-        config.adjust_submit_strategy();
-        assert_eq!(
-            config.submit_strategy,
-            Some(DAServerSubmitStrategy::Number(1))
-        );
-    }
-
-    #[test]
-    fn test_adjust_submit_strategy_number_too_high() {
-        let mut config = InternalDAServerConfig {
-            submit_strategy: Some(DAServerSubmitStrategy::Number(5)),
-            servers: vec![
-                InternalDAServerConfigType::Celestia(DAServerCelestiaConfig::default());
-                3
-            ], // Three servers for this test
+        let exp_celestia_config = DABackendOpenDAConfig {
+            scheme: OpenDAScheme::Celestia,
+            config: vec![
+                ("endpoint".to_string(), "test-conn".to_string()),
+                ("auth_token".to_string(), "test-auth".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            namespace: Some(
+                "000000000000000000000000000000000000000102030405060708090a".to_string(),
+            ),
+            max_segment_size: None,
+            max_retries: None,
         };
-        config.adjust_submit_strategy();
-        assert_eq!(
-            config.submit_strategy,
-            Some(DAServerSubmitStrategy::Number(3))
-        );
-    }
-
-    #[test]
-    fn test_adjust_submit_strategy_number_within_range() {
-        let mut config = InternalDAServerConfig {
-            submit_strategy: Some(DAServerSubmitStrategy::Number(2)),
-            servers: vec![
-                InternalDAServerConfigType::Celestia(DAServerCelestiaConfig::default());
-                4
-            ], // Four servers for this test
+        let exp_fs_config = DABackendOpenDAConfig {
+            scheme: OpenDAScheme::Fs,
+            config: HashMap::new(),
+            namespace: None,
+            max_segment_size: None,
+            max_retries: None,
         };
-        config.adjust_submit_strategy();
-        assert_eq!(
-            config.submit_strategy,
-            Some(DAServerSubmitStrategy::Number(2))
-        );
-    }
-
-    #[test]
-    fn test_internal_da_server_config_str() {
-        let celestia_config_str = r#"{"celestia": {"namespace": "test_namespace", "conn": "test_conn", "auth_token": "test_token", "max_segment_size": 2048}}"#;
-        let openda_config_str = r#"{"open-da": {"scheme": "gcs", "config": {"Param1": "value1", "param2": "Value2"}, "max_segment_size": 2048}}"#;
-        let invalid_config_str = r#"{"unknown": {...}}"#;
-
-        match InternalDAServerConfigType::from_str(celestia_config_str) {
-            Ok(InternalDAServerConfigType::Celestia(celestia_config)) => {
-                assert_eq!(
-                    celestia_config,
-                    DAServerCelestiaConfig {
-                        namespace: Some("test_namespace".to_string()),
-                        conn: Some("test_conn".to_string()),
-                        auth_token: Some("test_token".to_string()),
-                        max_segment_size: Some(2048),
-                    }
-                );
-            }
-            Ok(_) => {
-                panic!("Expected Celestia Config");
+        let exp_da_config = DAConfig {
+            da_backend: Some(DABackendConfig {
+                submit_strategy: Some(DASubmitStrategy::All),
+                backends: vec![
+                    DABackendConfigType::OpenDa(exp_gcs_config.clone()),
+                    DABackendConfigType::OpenDa(exp_celestia_config.clone()),
+                    DABackendConfigType::OpenDa(exp_fs_config.clone()),
+                ],
+            }),
+            da_min_block_to_submit: Some(340282366920938463463374607431768211455),
+            background_submit_interval: None,
+            base: None,
+        };
+        match DAConfig::from_str(da_config_str) {
+            Ok(da_config) => {
+                assert_eq!(da_config, exp_da_config);
             }
             Err(e) => {
-                panic!("Error parsing Celestia Config: {}", e)
+                println!(
+                    "expected: {:?}",
+                    serde_json::to_string(&exp_da_config).unwrap()
+                );
+                panic!("Error parsing DA Config: {}", e)
             }
         }
 
-        let mut config: HashMap<String, String> = HashMap::new();
-        config.insert("Param1".to_string(), "value1".to_string());
-        config.insert("param2".to_string(), "Value2".to_string());
+        let da_config_str = "{\"da-backend\": {\"backends\": [{\"open-da\": {\"scheme\": \"fs\", \"config\": {}}}]}}";
+        let exp_da_config = DAConfig {
+            da_backend: Some(DABackendConfig {
+                submit_strategy: None,
+                backends: vec![DABackendConfigType::OpenDa(exp_fs_config.clone())],
+            }),
+            da_min_block_to_submit: None,
+            background_submit_interval: None,
+            base: None,
+        };
+        match DAConfig::from_str(da_config_str) {
+            Ok(da_config) => {
+                assert_eq!(da_config, exp_da_config);
+            }
+            Err(e) => {
+                panic!("Error parsing DA Config: {}", e)
+            }
+        }
 
-        match InternalDAServerConfigType::from_str(openda_config_str) {
-            Ok(InternalDAServerConfigType::OpenDa(openda_config)) => {
-                assert_eq!(
-                    openda_config,
-                    DAServerOpenDAConfig {
+        let da_config_str = "{\"da-min-block-to-submit\":1023, \"da-backend\":{\"backends\":[{\"open-da\":{\"scheme\":\"gcs\",\"config\":{\"bucket\":\"$OPENDA_GCP_TESTNET_BUCKET\",\"credential\":\"$OPENDA_GCP_TESTNET_CREDENTIAL\"}}},{\"open-da\":{\"scheme\":\"avail\",\"config\":{\"turbo_endpoint\":\"$TURBO_DA_TURING_ENDPOINT\",\"turbo_api_key\":\"$TURBO_DA_TURING_API_KEY\"}}}]}}";
+        let exp_da_config = DAConfig {
+            da_backend: Some(DABackendConfig {
+                submit_strategy: None,
+                backends: vec![
+                    DABackendConfigType::OpenDa(DABackendOpenDAConfig {
                         scheme: OpenDAScheme::Gcs,
-                        config,
-                        max_segment_size: Some(2048),
-                    }
-                );
-            }
-            Ok(_) => {
-                panic!("Expected OpenDA Config");
+                        config: vec![
+                            (
+                                "bucket".to_string(),
+                                "$OPENDA_GCP_TESTNET_BUCKET".to_string(),
+                            ),
+                            (
+                                "credential".to_string(),
+                                "$OPENDA_GCP_TESTNET_CREDENTIAL".to_string(),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                        namespace: None,
+                        max_segment_size: None,
+                        max_retries: None,
+                    }),
+                    DABackendConfigType::OpenDa(DABackendOpenDAConfig {
+                        scheme: OpenDAScheme::Avail,
+                        config: vec![
+                            (
+                                "turbo_endpoint".to_string(),
+                                "$TURBO_DA_TURING_ENDPOINT".to_string(),
+                            ),
+                            (
+                                "turbo_api_key".to_string(),
+                                "$TURBO_DA_TURING_API_KEY".to_string(),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                        namespace: None,
+                        max_segment_size: None,
+                        max_retries: None,
+                    }),
+                ],
+            }),
+            da_min_block_to_submit: Some(1023),
+            background_submit_interval: None,
+            base: None,
+        };
+        match DAConfig::from_str(da_config_str) {
+            Ok(da_config) => {
+                assert_eq!(da_config, exp_da_config);
             }
             Err(e) => {
-                panic!("Error parsing OpenDA Config: {}", e)
+                panic!("Error parsing DA Config: {}", e)
             }
-        }
-
-        if InternalDAServerConfigType::from_str(invalid_config_str).is_err() {
-        } else {
-            panic!("Expected Error for invalid config");
         }
     }
 }

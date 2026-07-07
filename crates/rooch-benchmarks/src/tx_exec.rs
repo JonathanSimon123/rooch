@@ -1,23 +1,26 @@
 // Copyright (c) RoochNetwork
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::BenchTxConfig;
-use crate::config::TxType::{BtcBlock, BtcTx, Empty, Transfer};
-use crate::tx::{create_btc_blk_tx, create_l2_tx, find_block_height, prepare_btc_block};
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use criterion::{Criterion, SamplingMode};
+use tracing::info;
+
 use rooch_framework_tests::binding_test;
 use rooch_test_transaction_builder::TestTransactionBuilder;
 use rooch_types::crypto::RoochKeyPair;
 use rooch_types::transaction::LedgerTxData;
-use std::collections::HashMap;
-use std::path::PathBuf;
-use tracing::info;
+
+use crate::config::BenchTxConfig;
+use crate::config::TxType::{BtcBlock, BtcTx, Empty, Transfer, TransferLargeObject};
+use crate::tx::{create_btc_blk_tx, create_l2_tx, find_block_height, prepare_btc_block};
 
 // pure execution, no validate, sequence
 pub fn tx_exec_benchmark(c: &mut Criterion) {
     let config = BenchTxConfig::load();
 
-    let mut binding_test = binding_test::RustBindingTest::new().unwrap();
+    let mut binding_test = binding_test::RustBindingTest::new_in_tokio().unwrap();
     let kp = RoochKeyPair::generate_secp256k1();
     let mut test_transaction_builder = TestTransactionBuilder::new(kp);
 
@@ -27,13 +30,14 @@ pub fn tx_exec_benchmark(c: &mut Criterion) {
         BtcTx => ("btc_tx", 5), // The tx_cnt is the block count
         Transfer => ("l2_tx_transfer", 800),
         Empty => ("l2_tx_empty", 1000),
+        TransferLargeObject => ("l2_tx_transfer_large_object", 500),
     };
     let mut blocks = HashMap::new();
     let mut transactions: Vec<_> = Vec::with_capacity(tx_cnt);
     match tx_type {
         BtcBlock | BtcTx => {
             let btc_blk_dir = PathBuf::from(config.btc_block_dir.clone().unwrap());
-            //if the btc block dir is not absolute, we will treat it as relative to the workspace dir
+            //if the btc block dir isn't absolute, treat it as relative to the workspace dir
             let btc_blk_dir = if !btc_blk_dir.is_absolute() {
                 let workspace_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                     .parent()
@@ -85,16 +89,31 @@ pub fn tx_exec_benchmark(c: &mut Criterion) {
             }
         }
         _ => {
+            let mut seq_num = 0u64;
+            if tx_type.clone() == TransferLargeObject {
+                test_transaction_builder.update_sequence_number(seq_num);
+                seq_num += 1;
+                let publish_action = test_transaction_builder
+                    .new_publish_examples("large_objects", Some("rooch_examples".to_owned()))
+                    .unwrap();
+                let tx = test_transaction_builder
+                    .build_and_sign(publish_action)
+                    .unwrap();
+                binding_test.execute(tx).unwrap();
+            }
             for n in 0..tx_cnt {
-                let tx =
-                    create_l2_tx(&mut test_transaction_builder, n as u64, tx_type.clone()).unwrap();
+                let tx = create_l2_tx(
+                    &mut test_transaction_builder,
+                    seq_num + n as u64,
+                    tx_type.clone(),
+                )
+                .unwrap();
                 transactions.push(LedgerTxData::L2Tx(tx));
             }
         }
     }
     let sample_size = transactions.len();
     let mut transactions_iter = transactions.into_iter();
-
     let mut group = c.benchmark_group("bench_tx_exec");
     group.sample_size(sample_size);
     group.sampling_mode(SamplingMode::Flat);
@@ -114,8 +133,12 @@ pub fn tx_exec_benchmark(c: &mut Criterion) {
                         .execute_l1_block(l1_block_with_body.clone())
                         .unwrap();
                 }
-                LedgerTxData::L1Tx(tx) => binding_test.execute_l1_tx(tx).unwrap(),
-                LedgerTxData::L2Tx(tx) => binding_test.execute(tx).unwrap(),
+                LedgerTxData::L1Tx(tx) => {
+                    binding_test.execute_l1_tx(tx).unwrap();
+                }
+                LedgerTxData::L2Tx(tx) => {
+                    binding_test.execute(tx).unwrap();
+                }
             }
         });
     });

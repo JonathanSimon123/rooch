@@ -3,6 +3,7 @@
 
 module coins::fixed_supply_coin {
 
+    use std::option;
     use std::string;
     use moveos_std::signer;
     
@@ -11,7 +12,7 @@ module coins::fixed_supply_coin {
     use rooch_framework::coin_store::{Self, CoinStore};
     use rooch_framework::account_coin_store;
 
-    const TOTAL_SUPPLY: u256 = 210_000_000_000u256;
+    const TOTAL_SUPPLY: u256 = 210_000_000_000_00000000u256;
     const DECIMALS: u8 = 1u8;
 
     // The `FSC` CoinType has `key` and `store` ability.
@@ -25,9 +26,9 @@ module coins::fixed_supply_coin {
 
     fun init() {
         let coin_info_obj = coin::register_extend<FSC>(
-            
             string::utf8(b"Fixed Supply Coin"),
             string::utf8(b"FSC"),
+            option::none(),
             DECIMALS,
         );
         // Mint the total supply of coins, and store it to the treasury
@@ -46,7 +47,7 @@ module coins::fixed_supply_coin {
     public entry fun faucet(account: &signer, treasury_obj: &mut Object<Treasury>) {
         let account_addr = signer::address_of(account);
         let treasury = object::borrow_mut(treasury_obj);
-        let coin = coin_store::withdraw(&mut treasury.coin_store, 10000);
+        let coin = coin_store::withdraw(&mut treasury.coin_store, 1000000000000);
         account_coin_store::deposit(account_addr, coin);
     }
 }

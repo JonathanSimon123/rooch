@@ -15,46 +15,26 @@ rust-version = { workspace = true }
 
 [dependencies]
 anyhow = { workspace = true }
-async-trait = { workspace = true }
+anyhow-old = { git = "https://github.com/dtolnay/anyhow", tag = "1.0.76", package = "anyhow" }
+anyhow-new = { git = "https://github.com/dtolnay/anyhow", tag = "1.0.93", package = "anyhow" }
 bcs = { workspace = true }
-chrono = { workspace = true }
 clap = { workspace = true }
-coerce = { workspace = true }
-derive_builder = { workspace = true }
 ethers = { workspace = true }
-futures = { workspace = true }
-hex = { workspace = true }
-rustc-hex = { workspace = true }
 serde = { workspace = true }
-serde_yaml = { workspace = true }
-serde_json = { workspace = true }
-tower = { workspace = true }
-tower-http = { workspace = true }
-thiserror = { workspace = true }
-tokio = { features = ["full"], workspace = true }
-tonic = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-schemars = { workspace = true }
-serde_with = { workspace = true }
 rand = { workspace = true }
-fastcrypto = { workspace = true, features = ["copy_key"] }
-hyper = { workspace = true }
-log = { workspace = true }
 lazy_static = { workspace = true }
-rpassword = { workspace = true }
-tempfile = { workspace = true }
 criterion = { workspace = true }
 pprof = { workspace = true, features = ["flamegraph", "criterion", "cpp", "frame-pointer", "protobuf-codec"] }
-parking_lot = { workspace = true }
-proptest = { workspace = true }
-rand_core = { default-features = false, workspace = true }
 bitcoincore-rpc-json = { workspace = true }
 bitcoincore-rpc = { workspace = true }
 bitcoin = { workspace = true }
 toml = { workspace = true }
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-jemallocator = { version = "0.5.4", features = ["unprefixed_malloc_on_supported_platforms", "profiling"] }
+tikv-jemallocator = { workspace = true }
+prometheus = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 
 move-core-types = { workspace = true }
 move-resource-viewer = { workspace = true }
@@ -65,10 +45,13 @@ move-vm-types = { workspace = true }
 moveos = { workspace = true }
 moveos-store = { workspace = true }
 moveos-types = { workspace = true }
+moveos-common = { workspace = true }
+parking_lot = { workspace = true }
 move-bytecode-utils = { workspace = true }
 raw-store = { workspace = true }
 moveos-config = { workspace = true }
 smt = { workspace = true }
+metrics = { workspace = true }
 
 rooch-config = { workspace = true }
 rooch-types = { workspace = true }
@@ -87,6 +70,7 @@ rooch-test-transaction-builder = { workspace = true }
 rooch-framework = { workspace = true }
 rooch-framework-tests = { workspace = true }
 rooch-genesis = { workspace = true }
+rooch-pruner = { workspace = true }
 
 [dev-dependencies]
 
@@ -112,3 +96,11 @@ name = "bench_tx_exec"
 [[bench]]
 harness = false
 name = "bench_smt"
+
+[[bench]]
+harness = false
+name = "bench_indexer"
+
+[[bench]]
+harness = false
+name = "bench_gc"

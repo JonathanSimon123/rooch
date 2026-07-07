@@ -1,21 +1,21 @@
 // Copyright (c) RoochNetwork
 // SPDX-License-Identifier: Apache-2.0
 
-import { bech32m } from '@scure/base'
-import { schnorr, secp256k1 } from '@noble/curves/secp256k1'
+import { secp256k1, schnorr } from '@noble/curves/secp256k1'
 
-import { BitcoinAddress } from '../../address/index.js'
+import { AddressView, BitcoinNetowkType } from '../../address/index.js'
 import { PublicKey, PublicKeyInitData, SIGNATURE_SCHEME_TO_FLAG } from '../../crypto/index.js'
-import { Bytes, EmptyBytes } from '../../types/index.js'
 import { fromB64, sha256, toHEX } from '../../utils/index.js'
 
 const SCHNORR_PUBLIC_KEY_SIZE = 32
+const ECDSA_PUBLIC_KEY_SIZE = 33
 
 /**
  * A Secp256k1 public key
  */
-export class Secp256k1PublicKey extends PublicKey<BitcoinAddress> {
-  static SIZE = SCHNORR_PUBLIC_KEY_SIZE
+export class Secp256k1PublicKey extends PublicKey<AddressView> {
+  static SCHNORR_PUBKEY_SIZE = SCHNORR_PUBLIC_KEY_SIZE
+  static ECDSA_PUBKEY_SIZE = ECDSA_PUBLIC_KEY_SIZE
 
   private readonly data: Uint8Array
 
@@ -34,9 +34,12 @@ export class Secp256k1PublicKey extends PublicKey<BitcoinAddress> {
       this.data = Uint8Array.from(value)
     }
 
-    if (this.data.length !== SCHNORR_PUBLIC_KEY_SIZE && this.data.length !== 33) {
+    if (
+      this.data.length !== SCHNORR_PUBLIC_KEY_SIZE &&
+      this.data.length !== ECDSA_PUBLIC_KEY_SIZE
+    ) {
       throw new Error(
-        `Invalid public key input. Expected ${SCHNORR_PUBLIC_KEY_SIZE} bytes, got ${this.data.length}`,
+        `Invalid public key input. Expected ${SCHNORR_PUBLIC_KEY_SIZE} or ${ECDSA_PUBLIC_KEY_SIZE} bytes, got ${this.data.length}`,
       )
     }
   }
@@ -51,35 +54,23 @@ export class Secp256k1PublicKey extends PublicKey<BitcoinAddress> {
   /**
    * Return the byte array representation of the Secp256k1 public key
    */
-  toBytes(): Uint8Array {
+  override toBytes(): Uint8Array {
     return this.data
   }
 
-  toString(): string {
+  override toString(): string {
     return toHEX(this.data)
   }
 
   /**
    * Return the Bitcoin address associated with this Secp256k1 public key
    */
-  toAddress(): BitcoinAddress {
-    const tapTweak = (a: Bytes, b: Bytes) => {
-      const u = schnorr.utils
-      const t = u.taggedHash('TapTweak', a, b)
-      const tn = u.bytesToNumberBE(t)
-      if (tn >= secp256k1.CURVE.n) throw new Error('tweak higher than curve order')
-      return tn
-    }
+  override toAddress(): AddressView {
+    return new AddressView(this.data)
+  }
 
-    // Each hex char represents half a byte, hence hex address doubles the length
-    const u = schnorr.utils
-    const t = tapTweak(this.data, EmptyBytes) // t = int_from_bytes(tagged_hash("TapTweak", pubkey + h))
-    const P = u.lift_x(u.bytesToNumberBE(this.data)) // P = lift_x(int_from_bytes(pubkey))
-    const Q = P.add(secp256k1.ProjectivePoint.fromPrivateKey(t)) // Q = point_add(P, point_mul(G, t))
-    const tweakedPubkey = u.pointToBytes(Q)
-
-    /// bech32m version 1
-    return new BitcoinAddress(bech32m.encode('tb', [1].concat(bech32m.toWords(tweakedPubkey))))
+  toAddressWith(network: BitcoinNetowkType) {
+    return new AddressView(this.data, network)
   }
 
   /**
@@ -90,7 +81,7 @@ export class Secp256k1PublicKey extends PublicKey<BitcoinAddress> {
   }
 
   /**
-   * Verifies that the signature is valid for the provided message
+   * Verifies that the ecdsa signature is valid for the provided sha256 hashed message with 33 bytes public key
    */
   async verify(message: Uint8Array, signature: Uint8Array): Promise<boolean> {
     return secp256k1.verify(
@@ -98,5 +89,12 @@ export class Secp256k1PublicKey extends PublicKey<BitcoinAddress> {
       sha256(message),
       this.toBytes(),
     )
+  }
+
+  /**
+   * Verifies that the schnorr signature is valid for the provided message with 32 bytes public key
+   */
+  async verify_schnorr(message: Uint8Array, signature: Uint8Array): Promise<boolean> {
+    return schnorr.verify(signature, message, this.toBytes())
   }
 }

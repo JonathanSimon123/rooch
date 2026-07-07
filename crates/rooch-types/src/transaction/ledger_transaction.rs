@@ -2,12 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{RoochTransaction, TransactionSequenceInfo};
-use crate::{address::RoochAddress, multichain_id::MultiChainID};
+use crate::crypto::{RoochKeyPair, Signature};
+use crate::{
+    address::RoochAddress,
+    multichain_id::{MultiChainID, RoochMultiChainID},
+};
+use accumulator::accumulator_info::AccumulatorInfo;
 use anyhow::Result;
 use bitcoin::hashes::Hash;
 use core::fmt;
+use moveos_types::h256;
 use moveos_types::h256::H256;
 use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 
 #[derive(Clone, Debug, Default, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct L1Block {
@@ -36,7 +43,27 @@ pub struct L1BlockWithBody {
     pub block_body: Vec<u8>,
 }
 
-#[derive(Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+impl L1BlockWithBody {
+    pub fn new(block: L1Block, block_body: Vec<u8>) -> Self {
+        Self { block, block_body }
+    }
+
+    pub fn new_bitcoin_block(height: u64, block: bitcoin::Block) -> Self {
+        let block_hash = block.block_hash();
+        let block_body = crate::bitcoin::types::Block::from(block);
+        let l1_block = L1Block {
+            chain_id: RoochMultiChainID::Bitcoin.multichain_id(),
+            block_height: height,
+            block_hash: block_hash.to_byte_array().to_vec(),
+        };
+        Self {
+            block: l1_block,
+            block_body: block_body.encode(),
+        }
+    }
+}
+
+#[derive(Clone, Hash, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct L1Transaction {
     pub chain_id: MultiChainID,
     pub block_hash: Vec<u8>,
@@ -44,7 +71,7 @@ pub struct L1Transaction {
     pub txid: Vec<u8>,
 }
 
-impl fmt::Debug for L1Transaction {
+impl Display for L1Transaction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let block_hash = if self.chain_id.is_bitcoin() {
             bitcoin::BlockHash::from_slice(&self.block_hash)
@@ -113,6 +140,18 @@ impl LedgerTxData {
             LedgerTxData::L1Tx(_) => None,
         }
     }
+
+    pub fn is_l1_block(&self) -> bool {
+        matches!(self, LedgerTxData::L1Block(_))
+    }
+
+    pub fn is_l1_tx(&self) -> bool {
+        matches!(self, LedgerTxData::L1Tx(_))
+    }
+
+    pub fn is_l2_tx(&self) -> bool {
+        matches!(self, LedgerTxData::L2Tx(_))
+    }
 }
 
 /// The transaction which is recorded in the L2 DA ledger.
@@ -174,15 +213,25 @@ impl LedgerTransaction {
         tx_timestamp: u64,
         tx_order: u64,
         tx_order_signature: Vec<u8>,
-        tx_accumulator_root: H256,
+        tx_accumulator_info: AccumulatorInfo,
     ) -> LedgerTransaction {
-        let tx_sequence_info = TransactionSequenceInfo {
+        let tx_sequence_info = TransactionSequenceInfo::new(
             tx_order,
             tx_order_signature,
-            tx_accumulator_root,
+            tx_accumulator_info,
             tx_timestamp,
-        };
+        );
 
         LedgerTransaction::new(tx_data, tx_sequence_info)
+    }
+
+    /// Sign the tx order with the sequencer key.
+    pub fn sign_tx_order(tx_order: u64, tx_hash: H256, sequencer_key: &RoochKeyPair) -> Vec<u8> {
+        let mut witness_data = tx_hash.as_ref().to_vec();
+        witness_data.extend(tx_order.to_le_bytes().iter());
+        let witness_hash = h256::sha3_256_of(&witness_data);
+        Signature::sign(&witness_hash.0, sequencer_key)
+            .as_ref()
+            .to_vec()
     }
 }

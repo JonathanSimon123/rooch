@@ -12,9 +12,18 @@ module rooch_framework::session_key {
     use moveos_std::tx_meta::{Self, FunctionCallMeta};
     use rooch_framework::auth_validator;
     use moveos_std::timestamp;
+    use moveos_std::hash;
+    use moveos_std::address;
+    use moveos_std::string_utils;
 
     friend rooch_framework::transaction_validator;
     friend rooch_framework::session_validator;
+    friend rooch_framework::did;
+
+    const MAX_INACTIVE_INTERVAL: u64 = 3600 * 24 * 365; // 1 year
+    public fun max_inactive_interval(): u64 {
+        MAX_INACTIVE_INTERVAL
+    }
 
     /// Create session key in this context is not allowed
     const ErrorSessionKeyCreatePermissionDenied: u64 = 1;
@@ -24,6 +33,25 @@ module rooch_framework::session_key {
     const ErrorSessionKeyIsInvalid: u64 = 3;
     /// The lengths of the parts of the session's scope do not match.
     const ErrorSessionScopePartLengthNotMatch: u64 = 4;
+    /// The max inactive interval is invalid
+    const ErrorInvalidMaxInactiveInterval: u64 = 5;
+
+    // Signature scheme constant, similar to session_validator.move
+    const SIGNATURE_SCHEME_ED25519: u8 = 0;
+    const SIGNATURE_SCHEME_SECP256K1: u8 = 1;
+    const SIGNATURE_SCHEME_ECDSAR1: u8 = 2;
+    
+    public fun signature_scheme_ed25519(): u8 {
+        SIGNATURE_SCHEME_ED25519
+    }
+
+    public fun signature_scheme_secp256k1(): u8 {
+        SIGNATURE_SCHEME_SECP256K1
+    }
+
+    public fun signature_scheme_ecdsar1(): u8 {
+        SIGNATURE_SCHEME_ECDSAR1
+    }
 
     /// The session's scope
     struct SessionScope has store,copy,drop {
@@ -115,6 +143,21 @@ module rooch_framework::session_key {
 
         //Can not create new session key by the other session key
         assert!(!auth_validator::is_validate_via_session_key(), ErrorSessionKeyCreatePermissionDenied);
+        create_session_key_internal(sender, app_name, app_url, authentication_key, scopes, max_inactive_interval);
+    }
+
+    /// Create session key internal, it is used to create session key for DID document
+    /// It is allowed to create session key by the other session key
+    public(friend) fun create_session_key_internal(
+        sender: &signer,
+        app_name: std::string::String,
+        app_url: std::string::String,
+        authentication_key: vector<u8>,
+        scopes: vector<SessionScope>,
+        max_inactive_interval: u64) {
+
+        assert!(max_inactive_interval <= MAX_INACTIVE_INTERVAL, ErrorInvalidMaxInactiveInterval);
+
         let sender_addr = signer::address_of(sender);
         assert!(!exists_session_key(sender_addr, authentication_key), ErrorSessionKeyAlreadyExists);
         let now_seconds = timestamp::now_seconds();
@@ -187,6 +230,55 @@ module rooch_framework::session_key {
         create_session_key(sender, app_name, app_url, authentication_key, scopes, max_inactive_interval);
     }
 
+    /// Parse a scope string in the format "address::module::function"
+    /// Example: "0x1::counter::increment" or "0x2::*::*"
+    public fun parse_scope_string(scope_str: std::string::String): SessionScope {
+        let delimiter = std::string::utf8(b"::");
+        let parts = string_utils::split(&scope_str, &delimiter);
+        
+        // Should have exactly 3 parts: address, module, function
+        assert!(vector::length(&parts) == 3, ErrorSessionScopePartLengthNotMatch);
+        
+        // Extract address part and parse it
+        let address_str = *vector::borrow(&parts, 0);
+        let module_address =  address::from_string(&address_str);
+        
+        // Extract module name and function name
+        let module_name = *vector::borrow(&parts, 1);
+        let function_name = *vector::borrow(&parts, 2);
+        
+        SessionScope {
+            module_address,
+            module_name,
+            function_name,
+        }
+    }
+
+    /// Create session key with scope strings entry function
+    /// This is a more convenient version that allows passing scope strings directly
+    /// Format: "address::module::function", e.g., "0x1::counter::increment" or "0x2::*::*"
+    public entry fun create_session_key_with_scope_strings_entry(
+        sender: &signer,
+        app_name: std::string::String,
+        app_url: std::string::String,
+        authentication_key: vector<u8>,
+        scope_strings: vector<std::string::String>,
+        max_inactive_interval: u64) {
+        
+        let scopes = vector::empty<SessionScope>();
+        let idx = 0;
+        let scope_count = vector::length(&scope_strings);
+        
+        while (idx < scope_count) {
+            let scope_str = *vector::borrow(&scope_strings, idx);
+            let scope = parse_scope_string(scope_str);
+            vector::push_back(&mut scopes, scope);
+            idx = idx + 1;
+        };
+        
+        create_session_key(sender, app_name, app_url, authentication_key, scopes, max_inactive_interval);
+    }
+
     /// Check the current tx is in the session scope or not
     public(friend) fun in_session_scope(session_key: &SessionKey): bool{
         let idx = 0;
@@ -247,13 +339,23 @@ module rooch_framework::session_key {
     public fun active_session_key_for_test(authentication_key: vector<u8>) {
         active_session_key(authentication_key);
     }
+    
+    public fun contains_session_key(sender_addr: address, authentication_key: vector<u8>) : bool {
+        if(!account::exists_resource<SessionKeys>(sender_addr)){
+            return false
+        };
+        let session_keys = account::borrow_resource<SessionKeys>(sender_addr);
+        table::contains(&session_keys.keys, authentication_key)
+    }
 
     public fun remove_session_key(sender: &signer, authentication_key: vector<u8>) {
         let sender_addr = signer::address_of(sender);
         assert!(account::exists_resource<SessionKeys>(sender_addr), ErrorSessionKeyIsInvalid);
         let session_keys = account::borrow_mut_resource<SessionKeys>(sender_addr);
-        assert!(table::contains(&session_keys.keys, authentication_key), ErrorSessionKeyIsInvalid);
-        table::remove(&mut session_keys.keys, authentication_key);
+        // If the session key is not exists, do nothing
+        if (table::contains(&session_keys.keys, authentication_key)){
+            table::remove(&mut session_keys.keys, authentication_key);
+        }
     }
 
     public entry fun remove_session_key_entry(sender: &signer, authentication_key: vector<u8>) {
@@ -304,6 +406,62 @@ module rooch_framework::session_key {
 
         let function_call_meta = tx_meta::new_function_call_meta(@0x1, std::string::utf8(b"test1"), std::string::utf8(b"test"));
         assert!(!check_scope_match(&scope, &function_call_meta), 1004);
+    }
+
+    /// Derives the authentication key for an Ed25519 public key.
+    /// This is consistent with how session_validator derives it.
+    public fun ed25519_public_key_to_authentication_key(public_key: &vector<u8>): vector<u8> {
+        let bytes_for_hash = vector::singleton(SIGNATURE_SCHEME_ED25519);
+        vector::append(&mut bytes_for_hash, *public_key);
+        hash::blake2b256(&bytes_for_hash)
+    }
+
+    /// Derives the authentication key for a Secp256k1 public key.
+    /// This follows the same pattern as Ed25519 but with a different scheme identifier.
+    public fun secp256k1_public_key_to_authentication_key(public_key: &vector<u8>): vector<u8> {
+        let bytes_for_hash = vector::singleton(SIGNATURE_SCHEME_SECP256K1);
+        vector::append(&mut bytes_for_hash, *public_key);
+        hash::blake2b256(&bytes_for_hash)
+    }
+
+    /// Derives the authentication key for a Secp256r1 public key.
+    /// This follows the same pattern as Ed25519 but with a different scheme identifier.
+    public fun secp256r1_public_key_to_authentication_key(public_key: &vector<u8>): vector<u8> {
+        let auth_key = vector::empty<u8>();
+        vector::append(&mut auth_key, vector::singleton(SIGNATURE_SCHEME_ECDSAR1));
+        vector::append(&mut auth_key, hash::sha2_256(*public_key));
+        auth_key
+    }
+
+    #[test]
+    fun test_parse_scope_string() {
+        // Test with hex addresses
+        let scope_str = std::string::utf8(b"0x1::test_module::test_function");
+        let scope = parse_scope_string(scope_str);
+        
+        assert!(scope.module_address == @0x1, 2000);
+        assert!(scope.module_name == std::string::utf8(b"test_module"), 2001);
+        assert!(scope.function_name == std::string::utf8(b"test_function"), 2002);
+
+        // Test with asterisk
+        let scope_str2 = std::string::utf8(b"0x2::*::*");
+        let scope2 = parse_scope_string(scope_str2);
+        
+        assert!(scope2.module_address == @0x2, 2003);
+        assert!(scope2.module_name == std::string::utf8(b"*"), 2004);
+        assert!(scope2.function_name == std::string::utf8(b"*"), 2005);
+
+        // Test with bech32 address format
+        let addr = @0x42;
+        let bech32_addr_str = address::to_bech32_string(addr);
+        let scope_str3 = std::string::utf8(b"");
+        std::string::append(&mut scope_str3, bech32_addr_str);
+        std::string::append(&mut scope_str3, std::string::utf8(b"::counter::increment"));
+        let scope3 = parse_scope_string(scope_str3);
+        
+        assert!(scope3.module_address == @0x42, 2006);
+        assert!(scope3.module_name == std::string::utf8(b"counter"), 2007);
+        assert!(scope3.function_name == std::string::utf8(b"increment"), 2008);
     }
 
 }

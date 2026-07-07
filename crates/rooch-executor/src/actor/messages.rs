@@ -4,20 +4,21 @@
 use anyhow::Result;
 use coerce::actor::message::Message;
 use move_core_types::account_address::AccountAddress;
-use move_core_types::language_storage::StructTag;
 use moveos_types::access_path::AccessPath;
 use moveos_types::function_return_value::AnnotatedFunctionResult;
 use moveos_types::h256::H256;
 use moveos_types::moveos_std::event::{AnnotatedEvent, Event, EventID};
-use moveos_types::moveos_std::object::ObjectMeta;
-use moveos_types::state::{AnnotatedState, FieldKey, ObjectState};
+use moveos_types::moveos_std::object::{ObjectID, ObjectMeta};
+use moveos_types::state::{AnnotatedState, FieldKey, ObjectState, StateChangeSetExt};
 use moveos_types::state_resolver::{AnnotatedStateKV, StateKV};
-use moveos_types::transaction::FunctionCall;
 use moveos_types::transaction::TransactionExecutionInfo;
 use moveos_types::transaction::TransactionOutput;
 use moveos_types::transaction::VerifiedMoveOSTransaction;
+use moveos_types::transaction::{FunctionCall, RawTransactionOutput, VMErrorInfo};
 use rooch_types::address::MultiChainAddress;
-use rooch_types::transaction::{L1BlockWithBody, L1Transaction, RoochTransaction};
+use rooch_types::transaction::{
+    L1BlockWithBody, L1Transaction, RoochTransaction, RoochTransactionData,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug)]
@@ -41,6 +42,7 @@ impl Message for ValidateL1BlockMessage {
 #[derive(Debug)]
 pub struct ValidateL1TxMessage {
     pub l1_tx: L1Transaction,
+    pub bypass_executed_check: bool,
 }
 
 impl Message for ValidateL1TxMessage {
@@ -50,6 +52,7 @@ impl Message for ValidateL1TxMessage {
 #[derive(Debug)]
 pub struct ExecuteTransactionMessage {
     pub tx: VerifiedMoveOSTransaction,
+    pub tx_order: u64,
 }
 
 #[derive(Debug)]
@@ -73,6 +76,7 @@ impl Message for ExecuteViewFunctionMessage {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StatesMessage {
+    pub state_root: Option<H256>,
     pub access_path: AccessPath,
 }
 
@@ -91,6 +95,7 @@ impl Message for ResolveMessage {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AnnotatedStatesMessage {
+    pub state_root: Option<H256>,
     pub access_path: AccessPath,
 }
 
@@ -100,6 +105,7 @@ impl Message for AnnotatedStatesMessage {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ListStatesMessage {
+    pub state_root: Option<H256>,
     pub access_path: AccessPath,
     pub cursor: Option<FieldKey>,
     pub limit: usize,
@@ -111,6 +117,7 @@ impl Message for ListStatesMessage {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ListAnnotatedStatesMessage {
+    pub state_root: Option<H256>,
     pub access_path: AccessPath,
     pub cursor: Option<FieldKey>,
     pub limit: usize,
@@ -122,7 +129,7 @@ impl Message for ListAnnotatedStatesMessage {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetAnnotatedEventsByEventHandleMessage {
-    pub event_handle_type: StructTag,
+    pub event_handle_id: ObjectID,
     pub cursor: Option<u64>,
     pub limit: u64,
     pub descending_order: bool,
@@ -134,7 +141,7 @@ impl Message for GetAnnotatedEventsByEventHandleMessage {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetEventsByEventHandleMessage {
-    pub event_handle_type: StructTag,
+    pub event_handle_id: ObjectID,
     pub cursor: Option<u64>,
     pub limit: u64,
     pub descending_order: bool,
@@ -145,12 +152,21 @@ impl Message for GetEventsByEventHandleMessage {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct GetAnnotatedEventsByEventIDsMessage {
+    pub event_ids: Vec<EventID>,
+}
+
+impl Message for GetAnnotatedEventsByEventIDsMessage {
+    type Result = Result<Vec<Option<AnnotatedEvent>>>;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct GetEventsByEventIDsMessage {
     pub event_ids: Vec<EventID>,
 }
 
 impl Message for GetEventsByEventIDsMessage {
-    type Result = Result<Vec<Option<AnnotatedEvent>>>;
+    type Result = Result<Vec<Option<Event>>>;
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -177,4 +193,54 @@ pub struct GetRootMessage {}
 
 impl Message for GetRootMessage {
     type Result = Result<ObjectState>;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SaveStateChangeSetMessage {
+    pub tx_order: u64,
+    pub state_change_set: StateChangeSetExt,
+}
+
+impl Message for SaveStateChangeSetMessage {
+    type Result = Result<()>;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetStateChangeSetsMessage {
+    pub tx_orders: Vec<u64>,
+}
+
+impl Message for GetStateChangeSetsMessage {
+    type Result = Result<Vec<Option<StateChangeSetExt>>>;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CheckStateChangeSetsMessage {
+    pub tx_orders: Vec<u64>,
+}
+
+impl Message for CheckStateChangeSetsMessage {
+    type Result = Result<Vec<u64>>;
+}
+
+#[derive(Debug)]
+pub struct ConvertL2TransactionData {
+    pub tx_data: RoochTransactionData,
+}
+impl Message for ConvertL2TransactionData {
+    type Result = Result<VerifiedMoveOSTransaction>;
+}
+
+#[derive(Debug)]
+pub struct DryRunTransactionMessage {
+    pub tx: VerifiedMoveOSTransaction,
+}
+impl Message for DryRunTransactionMessage {
+    type Result = Result<DryRunTransactionResult>;
+}
+
+#[derive(Debug)]
+pub struct DryRunTransactionResult {
+    pub raw_output: RawTransactionOutput,
+    pub vm_error_info: Option<VMErrorInfo>,
 }

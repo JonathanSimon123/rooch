@@ -6,14 +6,20 @@ module bitcoin_move::pending_block{
     
     use std::vector;
     use std::option::{Self, Option};
+    use moveos_std::signer;
+    use moveos_std::signer::module_signer;
+    use moveos_std::module_store::{ensure_upgrade_permission};
+
     use moveos_std::object::{Self, Object, ObjectID};
     use moveos_std::simple_map::{Self, SimpleMap};
     use moveos_std::event;
+    use moveos_std::type_info;
+    
     use bitcoin_move::types::{Self, Transaction, Header, Block, BlockHeightHash};
-    use bitcoin_move::ord::{Flotsam};
 
     friend bitcoin_move::genesis;
     friend bitcoin_move::bitcoin;
+    friend bitcoin_move::inscription_updater;
 
     const ErrorBlockAlreadyProcessed:u64 = 1;
     const ErrorPendingBlockNotFound:u64 = 2;
@@ -24,7 +30,6 @@ module bitcoin_move::pending_block{
     const ErrorUnsupportedChain:u64 = 7;
 
     const TX_IDS_KEY: vector<u8> = b"tx_ids";
-    const BLOCK_FLOTSAM_KEY: vector<u8> = b"block_flotsam";
 
     struct PendingBlock has key{
         block_height: u64,
@@ -55,6 +60,12 @@ module bitcoin_move::pending_block{
         block_height: u64,
         block_hash: address,
         success: bool,
+    }
+
+    struct ReadyPendingBlockHeader has copy, drop, store {
+        block_height: u64,
+        block_hash: address,
+        header: Header,
     }
 
     public(friend) fun genesis_init(reorg_block_count: u64){
@@ -106,16 +117,45 @@ module bitcoin_move::pending_block{
         obj
     }
 
-    public(friend) fun add_pending_block(block_height: u64, block_hash: address, block: Block){
+    public(friend) fun add_pending_block(block_height: u64, block_hash: address, block: Block) : bool{
         let block_obj_id = pending_block_obj_id(block_hash);
-        assert!(!object::exists_object(block_obj_id), ErrorBlockAlreadyProcessed);
+        if(object::exists_object(block_obj_id)){
+            return false
+        };
 
         let store = borrow_mut_store();
         if(simple_map::contains_key(&store.pending_blocks, &block_height)){
             // block already exists, need to process reorg
-            handle_reog(store, block_height);
+            handle_reorg(store, block_height);
         };
         let (header, txs) = types::unpack_block(block);
+        add_pending_block_internal(store, block_height, block_hash, header, txs)
+    }
+
+    /// Header-only variant: only tracks header/topology, does not store tx bodies.
+    public(friend) fun add_pending_block_header_only(
+        block_height: u64,
+        block_hash: address,
+        header: Header
+    ): bool{
+        let store = borrow_mut_store();
+        add_pending_block_internal(store, block_height, block_hash, header, vector::empty())
+    }
+
+    fun add_pending_block_internal(
+        store: &mut PendingStore,
+        block_height: u64,
+        block_hash: address,
+        header: Header,
+        txs: vector<Transaction>
+    ): bool{
+        let block_obj_id = pending_block_obj_id(block_hash);
+        if(object::exists_object(block_obj_id)){
+            return false
+        };
+        if(simple_map::contains_key(&store.pending_blocks, &block_height)){
+            handle_reorg(store, block_height);
+        };
         let prev_block_hash = types::prev_blockhash(&header);
         let block_obj = object::new_with_id(block_hash, PendingBlock{
             block_height: block_height,
@@ -142,11 +182,24 @@ module bitcoin_move::pending_block{
 
         simple_map::add(&mut store.pending_blocks, block_height, block_hash);
         //The relayer should ensure the new block is the best block
-        //Maybe we should calculate the difficulty here in the future
         store.best_block = option::some(types::new_block_height_hash(block_height, block_hash));
+        true
     }
 
-    fun handle_reog(store: &mut PendingStore, reorg_block_height: u64){
+    /// Remove a header-only pending block right after processing, avoiding storage leak.
+    public(friend) fun remove_pending_block_header_only(block_hash: address){
+        if (!exists_pending_block(block_hash)) {
+            return
+        };
+        let store = borrow_mut_store();
+        let block_obj = take_pending_block(block_hash);
+        let block_height = object::borrow(&block_obj).block_height;
+        simple_map::remove(&mut store.pending_blocks, &block_height);
+        // tx_ids is empty in header-only path; mark processed to satisfy assertion
+        remove_pending_block(block_obj, true);
+    }
+
+    fun handle_reorg(store: &mut PendingStore, reorg_block_height: u64){
         let (_, reorg_block_hash) = simple_map::remove(&mut store.pending_blocks, &reorg_block_height);
         let reorg_block = take_pending_block(reorg_block_hash);
         let next_block_hash_option = object::borrow(&reorg_block).next_block_hash;
@@ -197,12 +250,31 @@ module bitcoin_move::pending_block{
             });
         };
         
-        if(object::contains_field(&obj, BLOCK_FLOTSAM_KEY)){
-            let _flotsam: vector<Flotsam> = object::remove_field(&mut obj, BLOCK_FLOTSAM_KEY);
-        };
         let pending_block = object::remove(obj);
         let PendingBlock{block_height:_, block_hash:_, header, processed_tx:_, next_block_hash:_} = pending_block;
         header
+    }
+
+    public(friend) fun block_height(pending_block: &Object<PendingBlock>): u64{
+        let block = object::borrow(pending_block);
+        block.block_height
+    }
+
+    /// The intermediate is used to store the intermediate state during the tx processing
+    public(friend) fun take_intermediate<I: store>(pending_block: &mut Object<PendingBlock>): I{
+        let intermediate_name = type_info::type_name<I>();
+        let intermediate = object::remove_field(pending_block, intermediate_name);
+        intermediate
+    }
+
+    public(friend) fun add_intermediate<I: store>(pending_block: &mut Object<PendingBlock>, intermediate: I){
+        let intermediate_name = type_info::type_name<I>();
+        object::add_field(pending_block, intermediate_name, intermediate);
+    }
+
+    public(friend) fun exists_intermediate<T>(pending_block: &Object<PendingBlock>): bool{
+        let intermediate_name = type_info::type_name<T>();
+        object::contains_field(pending_block, intermediate_name)
     }
 
     // ============== Pending Tx Processing ==============
@@ -243,13 +315,8 @@ module bitcoin_move::pending_block{
         header
     }
 
-    public(friend) fun inprocess_block_flotsams_mut(inprocess_block: &mut InprocessBlock): &mut vector<Flotsam>{
-        object::borrow_mut_field_with_default(&mut inprocess_block.block_obj, BLOCK_FLOTSAM_KEY, vector::empty())
-    }
-
-    public(friend) fun inprocess_block_flotsams(inprocess_block: &InprocessBlock): vector<Flotsam>{
-        let default = vector::empty<Flotsam>();
-        *object::borrow_field_with_default(&inprocess_block.block_obj, BLOCK_FLOTSAM_KEY, &default)
+    public(friend) fun inprocess_block_pending_block(inprocess_block: &mut InprocessBlock): &mut Object<PendingBlock>{
+        &mut inprocess_block.block_obj
     }
 
     public(friend) fun inprocess_block_tx(inprocess_block: &InprocessBlock): &Transaction{
@@ -273,6 +340,62 @@ module bitcoin_move::pending_block{
         txs: vector<address>,
     }
 
+    public(friend) fun pop_ready_pending_block_header(): Option<ReadyPendingBlockHeader> {
+        let store = borrow_mut_store();
+        if (option::is_none(&store.best_block)) {
+            return option::none()
+        };
+
+        let (best_block_height, _best_block_hash) =
+            types::unpack_block_height_hash(*option::borrow(&store.best_block));
+        if (best_block_height < store.reorg_block_count) {
+            return option::none()
+        };
+
+        let ready_block_height = best_block_height - store.reorg_block_count;
+        if (!simple_map::contains_key(&store.pending_blocks, &ready_block_height)) {
+            return option::none()
+        };
+
+        let block_hash = *simple_map::borrow(&store.pending_blocks, &ready_block_height);
+        let block_obj = borrow_pending_block(block_hash);
+        let prev_block_hash = types::prev_blockhash(&object::borrow(block_obj).header);
+        while (exists_pending_block(prev_block_hash)) {
+            let prev_block_obj = borrow_pending_block(prev_block_hash);
+            prev_block_hash = types::prev_blockhash(&object::borrow(prev_block_obj).header);
+            block_obj = prev_block_obj;
+        };
+
+        let ready_hash = object::borrow(block_obj).block_hash;
+        let ready_height = object::borrow(block_obj).block_height;
+        // Friend callers may use this API beyond header-only flow. Guard explicitly:
+        // header-only (no tx_ids) or fully processed tx-carrying block.
+        let tx_ids: vector<address> = *object::borrow_field(block_obj, TX_IDS_KEY);
+        if (!vector::is_empty(&tx_ids)) {
+            let processed_tx = object::borrow(block_obj).processed_tx;
+            assert!(processed_tx == vector::length(&tx_ids), ErrorPendingBlockNotFinished);
+        };
+        let ready_obj = take_pending_block(ready_hash);
+        simple_map::remove(&mut store.pending_blocks, &ready_height);
+        let header = remove_pending_block(ready_obj, true);
+        option::some(ReadyPendingBlockHeader {
+            block_height: ready_height,
+            block_hash: ready_hash,
+            header,
+        })
+    }
+
+    public(friend) fun unpack_ready_pending_block_header(
+        ready_block: ReadyPendingBlockHeader
+    ): (u64, address, Header) {
+        let ReadyPendingBlockHeader {
+            block_height,
+            block_hash,
+            header,
+        } = ready_block;
+        (block_height, block_hash, header)
+    }
+
     /// Get the pending txs which are ready to be processed
     public fun get_ready_pending_txs(): Option<PendingTxs>{
         let store = borrow_store();
@@ -289,7 +412,18 @@ module bitcoin_move::pending_block{
         };
         let block_hash = *simple_map::borrow(&store.pending_blocks, &ready_block_height);
         let block_obj = borrow_pending_block(block_hash);
+        let prev_block_hash = types::prev_blockhash(&object::borrow(block_obj).header);
+        while(exists_pending_block(prev_block_hash)){
+            let prev_block_obj = borrow_pending_block(prev_block_hash);
+            prev_block_hash = types::prev_blockhash(&object::borrow(prev_block_obj).header);
+            block_obj = prev_block_obj;
+        };
+
         let tx_ids: vector<address> = *object::borrow_field(block_obj, TX_IDS_KEY);
+        if (vector::is_empty(&tx_ids)) {
+            // header-only mode: no txs to process
+            return option::none()
+        };
         let unprocessed_tx_ids : vector<address> = vector::filter(tx_ids, |txid| {
             object::contains_field(block_obj, *txid)
         });
@@ -310,7 +444,23 @@ module bitcoin_move::pending_block{
         store.reorg_block_count
     }
 
+    #[test_only]
+    public fun set_reorg_block_count_for_test(count: u64){
+        let store = borrow_mut_store();
+        store.reorg_block_count = count;
+    }
+
     //====== Update functions ======
+
+    /// Update the `reorg_block_count` config
+    public entry fun update_reorg_block_count(signer: &signer, count: u64){
+        let module_signer = module_signer<PendingStore>();
+        let package_id = signer::address_of(&module_signer);
+        ensure_upgrade_permission(package_id, signer);
+
+        let store = borrow_mut_store();
+        store.reorg_block_count = count;
+    }
 
     /// Update the `reorg_block_count` config for local env to testing
     public entry fun update_reorg_block_count_for_local(count: u64){

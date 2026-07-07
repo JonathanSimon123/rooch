@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    AnnotatedMoveStructView, BytesView, H256View, HumanReadableDisplay, ObjectIDVecView,
-    RoochAddressView, RoochOrBitcoinAddressView, StrView, StructTagView, TypeTagView,
+    AnnotatedMoveStructView, AnnotatedMoveValueView, BytesView, H256View, HumanReadableDisplay,
+    ObjectIDVecView, ObjectIDView, QueryOptions, RoochAddressView, StrView, StructTagView,
+    TypeTagView, UnitedAddressView,
 };
 use anyhow::Result;
 use move_core_types::effects::Op;
@@ -15,6 +16,7 @@ use moveos_types::{
     state::{AnnotatedState, ObjectState, StateChangeSet},
 };
 use rooch_types::indexer::state::{IndexerStateID, ObjectStateFilter};
+use rooch_types::state::{StateChangeSetWithTxOrder, SyncStateFilter};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -104,11 +106,88 @@ impl From<ObjectMetaView> for ObjectMeta {
     }
 }
 
+impl HumanReadableDisplay for ObjectMetaView {
+    fn to_human_readable_string(&self, verbose: bool, indent: usize) -> String {
+        if verbose {
+            format!(
+                r#"{indent}{}
+{indent}  objectId       | {}
+{indent}  type           | {}
+{indent}  owner          | {}
+{indent}  owner(bitcoin) | {:?}
+{indent}  status         | {}
+{indent}{}"#,
+                "-".repeat(100),
+                self.id,
+                self.object_type,
+                self.owner,
+                self.owner_bitcoin_address,
+                human_readable_flag(self.flag),
+                "-".repeat(100),
+                indent = " ".repeat(indent),
+            )
+        } else {
+            format!(
+                r#"{indent}objectId: {}
+{indent}type    : {}"#,
+                self.id,
+                self.object_type,
+                indent = " ".repeat(indent),
+            )
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct StateChangeSetView {
     pub state_root: H256View,
     pub global_size: StrView<u64>,
     pub changes: Vec<ObjectChangeView>,
+}
+
+impl StateChangeSetView {
+    // Parse the new/modified/deleted objects from the state change set.
+    pub fn parse_changed_objects(
+        &self,
+    ) -> (
+        Vec<ObjectMetaView>,
+        Vec<ObjectMetaView>,
+        Vec<ObjectMetaView>,
+    ) {
+        parse_changed_objects(&self.changes)
+    }
+}
+impl HumanReadableDisplay for StateChangeSetView {
+    fn to_human_readable_string(&self, _verbose: bool, indent: usize) -> String {
+        let (new_objs, modified_objs, deleted_objs) = parse_changed_objects(&self.changes);
+
+        format!(
+            r#"{indent}New objects:
+{indent}{}
+
+{indent}Modified objects:
+{indent}{}
+
+{indent}Removed objects:
+{indent}{}"#,
+            if new_objs.is_empty() {
+                "    None".to_owned()
+            } else {
+                new_objs.to_human_readable_string(false, 4)
+            },
+            if modified_objs.is_empty() {
+                "    None".to_owned()
+            } else {
+                modified_objs.to_human_readable_string(false, 4)
+            },
+            if deleted_objs.is_empty() {
+                "    None".to_owned()
+            } else {
+                deleted_objs.to_human_readable_string(false, 4)
+            },
+            indent = " ".repeat(indent),
+        )
+    }
 }
 
 impl From<StateChangeSet> for StateChangeSetView {
@@ -214,7 +293,7 @@ pub struct IndexerObjectStateView {
     pub metadata: ObjectMetaView,
     /// bcs bytes of the Object.
     pub value: BytesView,
-    pub decoded_value: Option<AnnotatedMoveStructView>,
+    pub decoded_value: Option<serde_json::Value>,
     #[serde(flatten)]
     pub indexer_id: IndexerStateIDView,
     pub display_fields: Option<DisplayFieldsView>,
@@ -243,10 +322,33 @@ impl IndexerObjectStateView {
         IndexerObjectStateView {
             metadata: metadata.into(),
             value: value.into(),
-            decoded_value: Some(AnnotatedMoveStructView::from(decoded_value)),
+            decoded_value: Some(AnnotatedMoveStructView::from(decoded_value).into()),
             indexer_id: indexer_id.into(),
             display_fields: None,
         }
+    }
+
+    pub fn try_new_from_annotated_state(
+        state: AnnotatedState,
+        indexer_id: IndexerStateID,
+    ) -> Result<IndexerObjectStateView> {
+        let (metadata, value, decoded_value) = state.into_inner();
+        let mut size = 0;
+        decoded_value.value.iter().for_each(|(_k, v)| {
+            size += AnnotatedMoveValueView::size_of_struct_recursively(v);
+        });
+        // make the size limit configurable
+        if size > 200 {
+            anyhow::bail!("The size of the object is too large to decode and display");
+        }
+
+        Ok(IndexerObjectStateView {
+            metadata: metadata.into(),
+            value: value.into(),
+            decoded_value: Some(AnnotatedMoveStructView::from(decoded_value).into()),
+            indexer_id: indexer_id.into(),
+            display_fields: None,
+        })
     }
 
     pub fn with_owner_bitcoin_address(mut self, owner_bitcoin_address: Option<String>) -> Self {
@@ -261,19 +363,19 @@ impl IndexerObjectStateView {
 }
 
 impl HumanReadableDisplay for IndexerObjectStateView {
-    fn to_human_readable_string(&self, verbose: bool) -> String {
+    fn to_human_readable_string(&self, verbose: bool, indent: usize) -> String {
         let _ = verbose; // TODO: implement verbose string
 
         format!(
-            r#"{}
-  objectId       | {}
-  type           | {}
-  owner          | {}
-  owner(bitcoin) | {:?}
-  status         | {}
-  tx_order       | {}
-  state_index    | {}
-{}"#,
+            r#"{indent}{}
+{indent}  objectId       | {}
+{indent}  type           | {}
+{indent}  owner          | {}
+{indent}  owner(bitcoin) | {:?}
+{indent}  status         | {}
+{indent}  tx_order       | {}
+{indent}  state_index    | {}
+{indent}{}"#,
             "-".repeat(100),
             self.metadata.id,
             self.metadata.object_type,
@@ -283,6 +385,7 @@ impl HumanReadableDisplay for IndexerObjectStateView {
             self.indexer_id.tx_order,
             self.indexer_id.state_index,
             "-".repeat(100),
+            indent = " ".repeat(indent),
         )
     }
 }
@@ -293,12 +396,12 @@ pub enum ObjectStateFilterView {
     /// Query by object value type and owner.
     ObjectTypeWithOwner {
         object_type: StructTagView,
-        owner: RoochOrBitcoinAddressView,
+        owner: UnitedAddressView,
     },
     /// Query by object value type.
     ObjectType(StructTagView),
     /// Query by owner.
-    Owner(RoochOrBitcoinAddressView),
+    Owner(UnitedAddressView),
     /// Query by object ids.
     ObjectId(ObjectIDVecView),
 }
@@ -306,12 +409,14 @@ pub enum ObjectStateFilterView {
 impl ObjectStateFilterView {
     pub fn try_into_object_state_filter(
         state_filter: ObjectStateFilterView,
+        query_option: QueryOptions,
     ) -> Result<ObjectStateFilter> {
         Ok(match state_filter {
             ObjectStateFilterView::ObjectTypeWithOwner { object_type, owner } => {
                 ObjectStateFilter::ObjectTypeWithOwner {
                     object_type: object_type.into(),
                     owner: owner.into(),
+                    filter_out: query_option.filter_out,
                 }
             }
             ObjectStateFilterView::ObjectType(object_type) => {
@@ -331,7 +436,7 @@ pub struct ObjectStateView {
     #[serde(flatten)]
     pub metadata: ObjectMetaView,
     pub value: BytesView,
-    pub decoded_value: Option<AnnotatedMoveStructView>,
+    pub decoded_value: Option<serde_json::Value>,
     pub display_fields: Option<DisplayFieldsView>,
 }
 
@@ -343,7 +448,7 @@ impl ObjectStateView {
             metadata: metadata.into(),
             value: value.into(),
             decoded_value: if decode {
-                Some(AnnotatedMoveStructView::from(decoded_value))
+                Some(AnnotatedMoveStructView::from(decoded_value).into())
             } else {
                 None
             },
@@ -392,25 +497,8 @@ impl From<AnnotatedState> for ObjectStateView {
 }
 
 impl HumanReadableDisplay for ObjectStateView {
-    fn to_human_readable_string(&self, verbose: bool) -> String {
-        let _ = verbose; // TODO: implement verbose string
-
-        format!(
-            r#"{}
-  objectId       | {}
-  type           | {}
-  owner          | {}
-  owner(bitcoin) | {:?}
-  status         | {}
-{}"#,
-            "-".repeat(100),
-            self.metadata.id,
-            self.metadata.object_type,
-            self.metadata.owner,
-            self.metadata.owner_bitcoin_address,
-            human_readable_flag(self.metadata.flag),
-            "-".repeat(100),
-        )
+    fn to_human_readable_string(&self, verbose: bool, indent: usize) -> String {
+        self.metadata.to_human_readable_string(verbose, indent)
     }
 }
 
@@ -418,11 +506,72 @@ impl<T> HumanReadableDisplay for Vec<T>
 where
     T: HumanReadableDisplay,
 {
-    fn to_human_readable_string(&self, verbose: bool) -> String {
+    fn to_human_readable_string(&self, verbose: bool, indent: usize) -> String {
         let _ = verbose;
         self.iter()
-            .map(|s| s.to_human_readable_string(verbose))
+            .map(|s| s.to_human_readable_string(verbose, indent))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n\n")
+    }
+}
+
+fn parse_changed_objects(
+    changes: &Vec<ObjectChangeView>,
+) -> (
+    Vec<ObjectMetaView>,
+    Vec<ObjectMetaView>,
+    Vec<ObjectMetaView>,
+) {
+    let mut new_objs = vec![];
+    let mut modified_objs = vec![];
+    let mut deleted_objs = vec![];
+    for obj_change in changes {
+        let metadata = obj_change.metadata.clone();
+        // There may have 3 type of changes: metadata, value, fields
+        match obj_change.value {
+            Some(OpView::New(_)) => new_objs.push(metadata),
+            Some(OpView::Modify(_)) => modified_objs.push(metadata),
+            Some(OpView::Delete) => deleted_objs.push(metadata),
+            None => modified_objs.push(metadata), // no value change, there must has field changes.
+        };
+        let (field_new_objs, field_modified_objs, field_deleted_objs) =
+            parse_changed_objects(&obj_change.fields);
+        new_objs.extend(field_new_objs);
+        modified_objs.extend(field_modified_objs);
+        deleted_objs.extend(field_deleted_objs);
+    }
+    (new_objs, modified_objs, deleted_objs)
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncStateFilterView {
+    /// Sync by object id.
+    ObjectID(ObjectIDView),
+    /// Sync all.
+    All,
+}
+
+impl From<SyncStateFilterView> for SyncStateFilter {
+    fn from(state_filter: SyncStateFilterView) -> Self {
+        match state_filter {
+            SyncStateFilterView::ObjectID(object_id) => SyncStateFilter::ObjectID(object_id.into()),
+            SyncStateFilterView::All => SyncStateFilter::All,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct StateChangeSetWithTxOrderView {
+    pub tx_order: StrView<u64>,
+    pub state_change_set: StateChangeSetView,
+}
+
+impl From<StateChangeSetWithTxOrder> for StateChangeSetWithTxOrderView {
+    fn from(state_change_set: StateChangeSetWithTxOrder) -> Self {
+        Self {
+            tx_order: state_change_set.tx_order.into(),
+            state_change_set: state_change_set.state_change_set.into(),
+        }
     }
 }

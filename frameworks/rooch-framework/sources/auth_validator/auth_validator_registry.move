@@ -8,7 +8,7 @@ module rooch_framework::auth_validator_registry {
     use moveos_std::table::{Self, Table};
     use moveos_std::type_table::{Self, TypeTable};
     use moveos_std::features;
-    
+    use moveos_std::core_addresses;
     use rooch_framework::auth_validator::{Self, AuthValidator};
 
     friend rooch_framework::genesis;
@@ -31,7 +31,8 @@ module rooch_framework::auth_validator_registry {
     /// Init function called by genesis.
     public(friend) fun genesis_init(sender: &signer){
         let registry = ValidatorRegistry {
-            validator_num: 0,
+            //custom auth validator id start from 100
+            validator_num: 100,
             validators: table::new(),
             validators_with_type: type_table::new(),
         };
@@ -39,9 +40,43 @@ module rooch_framework::auth_validator_registry {
     }
 
     #[private_generics(ValidatorType)]
+    /// Register a new validator. This feature not enabled in the mainnet.
     public fun register<ValidatorType: store>() : u64{
         features::ensure_testnet_enabled();
         register_internal<ValidatorType>()
+    }
+
+    /// Register a new validator by system. This function is only called by system.
+    public fun register_by_system<ValidatorType: store>(system: &signer) : u64{
+        core_addresses::assert_system_reserved(system);
+        register_internal<ValidatorType>()
+    }
+
+    public fun register_by_system_with_id<ValidatorType: store>(system: &signer, id: u64) : u64{
+        core_addresses::assert_system_reserved(system);
+        register_internal_with_id<ValidatorType>(id)
+    }
+
+    public(friend) fun register_internal_with_id<ValidatorType: store>(id: u64) : u64{
+        let type_info = type_info::type_of<ValidatorType>();
+        let module_address = type_info::account_address(&type_info);
+        let module_name = type_info::module_name(&type_info);
+        
+        let registry = account::borrow_mut_resource<ValidatorRegistry>(@rooch_framework);
+        assert!(!type_table::contains<AuthValidatorWithType<ValidatorType>>(&registry.validators_with_type), ErrorValidatorAlreadyRegistered);
+        
+        let validator_with_type = AuthValidatorWithType<ValidatorType>{
+            id,
+        };
+        type_table::add(&mut registry.validators_with_type, validator_with_type);
+
+        let validator = auth_validator::new_auth_validator(
+            id,
+            module_address,
+            module_name,
+        );
+        table::add(&mut registry.validators, id, validator);
+        id
     }
 
     public(friend) fun register_internal<ValidatorType: store>() : u64{
@@ -51,6 +86,10 @@ module rooch_framework::auth_validator_registry {
 
         let registry = account::borrow_mut_resource<ValidatorRegistry>(@rooch_framework);
         let id = registry.validator_num;
+        //The testnet and mainnet alreay initialized the validator_num to 0, so we need to set it to 100
+        if (id < 100) {
+            registry.validator_num = 100;
+        };
 
         assert!(!type_table::contains<AuthValidatorWithType<ValidatorType>>(&registry.validators_with_type), ErrorValidatorAlreadyRegistered);
         
@@ -70,17 +109,18 @@ module rooch_framework::auth_validator_registry {
         id
     }
 
-    public fun borrow_validator(id: u64): &AuthValidator {
-        features::ensure_testnet_enabled();
+    public fun is_registered<ValidatorType: store>(): bool{
+        let registry = account::borrow_resource<ValidatorRegistry>(@rooch_framework);
+        type_table::contains<AuthValidatorWithType<ValidatorType>>(&registry.validators_with_type)
+    }
 
+    public fun borrow_validator(id: u64): &AuthValidator {
         let registry = account::borrow_resource<ValidatorRegistry>(@rooch_framework);
         assert!(table::contains(&registry.validators, id), ErrorValidatorUnregistered);
         table::borrow(&registry.validators, id)
     }
 
     public fun borrow_validator_by_type<ValidatorType: store>(): &AuthValidator {
-        features::ensure_testnet_enabled();
-        
         let registry = account::borrow_resource<ValidatorRegistry>(@rooch_framework);
         assert!(type_table::contains<AuthValidatorWithType<ValidatorType>>(&registry.validators_with_type), ErrorValidatorUnregistered);
         let validator_with_type = type_table::borrow<AuthValidatorWithType<ValidatorType>>(&registry.validators_with_type);

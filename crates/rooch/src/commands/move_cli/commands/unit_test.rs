@@ -16,7 +16,7 @@ use moveos_object_runtime::runtime::{ObjectRuntime, ObjectRuntimeContext};
 use moveos_stdlib::natives::moveos_stdlib::{
     event::NativeEventContext, move_module::NativeModuleContext,
 };
-use moveos_store::MoveOSStore;
+use moveos_store::{load_feature_store_object, MoveOSStore};
 use moveos_types::moveos_std::object::ObjectMeta;
 use moveos_types::{moveos_std::tx_context::TxContext, state_resolver::RootObjectResolver};
 use moveos_verifier::build::build_model_with_test_attr;
@@ -30,6 +30,7 @@ use serde_json::Value;
 use std::rc::Rc;
 use std::{collections::BTreeMap, path::PathBuf};
 use termcolor::Buffer;
+use tokio::runtime::Runtime;
 
 #[derive(Parser)]
 #[group(skip)]
@@ -76,8 +77,7 @@ impl CommandAction<Option<Value>> for TestCommand {
 
         let resolution_graph = build_config
             .clone()
-            .resolution_graph_for_package(&root_path, &mut Vec::new())
-            .expect("resolve package dep failed");
+            .resolution_graph_for_package(&root_path, &mut Vec::new())?;
 
         let mut additional_named_address = BTreeMap::new();
         let _: Vec<_> = resolution_graph
@@ -122,8 +122,11 @@ impl CommandAction<Option<Value>> for TestCommand {
     }
 }
 
-static MOVEOSSTORE: Lazy<(MoveOSStore, DataDirPath)> =
-    Lazy::new(|| MoveOSStore::mock_moveos_store().unwrap());
+static MOVEOSSTORE: Lazy<(MoveOSStore, DataDirPath)> = Lazy::new(|| {
+    let runtime = Runtime::new()
+        .expect("Failed to create Tokio runtime when mock moveos store in move unit test");
+    runtime.block_on(async { MoveOSStore::mock_moveos_store().unwrap() })
+});
 
 static RESOLVER: Lazy<Box<RootObjectResolver<MoveOSStore>>> = Lazy::new(|| {
     Box::new(RootObjectResolver::new(
@@ -141,7 +144,8 @@ fn new_moveos_natives_runtime(ext: &mut NativeContextExtensions) {
         resolver,
         genesis_config::G_LOCAL_CONFIG.genesis_objects.clone(),
     )));
-    let table_ext = ObjectRuntimeContext::new(object_runtime);
+    let feature_store = load_feature_store_object(resolver);
+    let table_ext = ObjectRuntimeContext::new(object_runtime, feature_store);
     let module_ext = NativeModuleContext::new(resolver);
     let event_ext = NativeEventContext::default();
     ext.add(table_ext);

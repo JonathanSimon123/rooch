@@ -5,7 +5,12 @@
 /// For more details, please refer to https://rooch.network/docs/developer-guides/object
 module moveos_std::object {
     use std::hash;
+    use std::option::{Self, Option};
+    use std::string;
+    use std::string::String;
     use std::vector;
+    use moveos_std::core_addresses;
+    use moveos_std::hex;
     use moveos_std::signer;
     use moveos_std::tx_context;
     use moveos_std::bcs;
@@ -16,6 +21,7 @@ module moveos_std::object {
     friend moveos_std::module_store;
     friend moveos_std::event;
     friend moveos_std::table;
+    friend moveos_std::linked_table;
     friend moveos_std::type_table;
     friend moveos_std::bag;
     friend moveos_std::genesis;
@@ -39,7 +45,7 @@ module moveos_std::object {
     const ErrorTypeMismatch: u64 = 10;
     /// The child object level is too deep
     const ErrorChildObjectTooDeep: u64 = 11;
-    /// The object has no parent 
+    /// The object has no parent
     const ErrorWithoutParent: u64 = 12;
     /// The parent object is not match
     const ErrorParentNotMatch: u64 = 13;
@@ -47,6 +53,8 @@ module moveos_std::object {
     const ErrorObjectRuntimeError: u64 = 14;
     /// The object or field is already taken out or embedded in other struct
     const ErrorObjectAlreadyTakenOutOrEmbeded: u64 = 15;
+    /// The hex string is invalid
+    const ErrorInvalidHex: u64 = 16;
 
     const SYSTEM_OWNER_ADDRESS: address = @0x0;
 
@@ -119,7 +127,7 @@ module moveos_std::object {
         )
     }
 
-    public fun account_named_object_id<T: key>(account: address): ObjectID {
+    public fun account_named_object_id<T>(account: address): ObjectID {
         let bytes = bcs::to_bytes(&account);
         vector::append(&mut bytes, *std::string::bytes(&type_info::type_name<T>()));
         address_to_object_id(
@@ -129,18 +137,86 @@ module moveos_std::object {
         )
     }
 
-    public fun custom_object_id<ID: store + copy + drop, T: key>(id: ID): ObjectID {
+    public fun custom_object_id<ID: store + copy + drop, T>(id: ID): ObjectID {
         address_to_object_id(derive_object_key<ID, T>(id))
     }
 
-    public fun custom_object_id_with_parent<ID: store + copy + drop, T: key>(parent_id: ObjectID, id: ID): ObjectID {
+    public fun custom_object_id_with_parent<ID: store + copy + drop, T>(parent_id: ObjectID, id: ID): ObjectID {
         let child = derive_object_key<ID, T>(id);
         let path = parent_id.path;
         vector::push_back(&mut path, child);
-        ObjectID { path } 
+        ObjectID { path }
     }
 
-    /// Object<T> is a pointer type to the Object in storage, It has `key` and `store` ability. 
+    /// the ObjectI::to_string() format is the same as ObjectID::to_str() in Rust
+    public fun to_string(id: &ObjectID): String{
+        let bytes = vector::empty<u8>();
+        let i = 0;
+
+        // Flatten all addresses into a single byte vector
+        while (i < vector::length(&id.path)) {
+            let addr = *vector::borrow(&id.path, i);
+            let addr_bytes = bcs::to_bytes(&addr);
+            vector::append(&mut bytes, addr_bytes);
+            i = i + 1;
+        };
+
+        // Convert to hex string with "0x" prefix
+        let hex_value = hex::encode(bytes);
+        let hex_str = string::utf8(b"0x");
+        string::append(&mut hex_str, string::utf8(hex_value));
+        hex_str
+    }
+
+    public fun from_string(str: &String): ObjectID{
+        let bytes = *string::bytes(str);
+
+        // Strip "0x" prefix if present
+        if (vector::length(&bytes) >= 2 && vector::slice(&bytes, 0, 2) == b"0x") {
+            bytes = vector::slice(&bytes, 2, vector::length(&bytes));
+        };
+
+        // Handle empty string (root object)
+        if (vector::is_empty(&bytes)) {
+            return ObjectID { path: vector::empty() }
+        };
+
+        // Pad with zeros if too short
+        let hex_len = vector::length(&bytes);
+        if (hex_len < address::length() * 2) {
+            let padded = vector::empty<u8>();
+            let i = 0;
+            while (i < address::length() * 2 - hex_len) {
+                vector::append(&mut padded, b"0");
+                i = i + 1;
+            };
+            vector::append(&mut padded, bytes);
+            bytes = padded;
+        };
+
+        // Convert hex string to bytes and create address
+        let addr_bytes = hex::decode(&bytes);
+        let path = create_address_from_bytes(addr_bytes);
+
+        ObjectID { path }
+    }
+
+    /// Create addresses from bytes
+    fun create_address_from_bytes(bytes: vector<u8>): vector<address> {
+        assert!(vector::length(&bytes) >= address::length(), ErrorInvalidHex);
+        let addresses = vector::empty<address>();
+
+        while (vector::length(&bytes) >= address::length()) {
+            let addr_bytes = vector::slice(&bytes, 0, address::length());
+            let addr = address::from_bytes(addr_bytes);
+            vector::push_back(&mut addresses, addr);
+            bytes = vector::slice(&bytes, address::length(), vector::length(&bytes));
+        };
+        addresses
+
+    }
+
+    /// Object<T> is a pointer type to the Object in storage, It has `key` and `store` ability.
     struct Object<phantom T> has key, store {
         id: ObjectID,
     }
@@ -290,12 +366,19 @@ module moveos_std::object {
     }
 
     /// Remove the object from the global storage, and return the object value
-    /// Do not check if the dynamic fields are empty 
+    /// Do not check if the dynamic fields are empty
     public(friend) fun remove_unchecked<T: key>(self: Object<T>): T {
         let Object{id} = self;
         let (parent, key) = into_parent_id_and_key(id);
         let value = native_remove_field<T>(parent, key);
         value
+    }
+
+    /// Clear all direct dynamic fields of the object and reset its field tree to the empty root.
+    /// The object value, id, owner, and flags are preserved.
+    public fun clear_fields_by_system<T: key>(system: &signer, obj: &mut Object<T>) {
+        core_addresses::assert_system_reserved(system);
+        native_clear_fields<T>(id(obj));
     }
 
     /// Make the Object shared, Any one can get the &mut Object<T> from shared object
@@ -391,6 +474,12 @@ module moveos_std::object {
         &native_borrow_field<DynamicField<Name, Value>>(obj_id, field_key).value
     }
 
+    /// Direct field access based on field_key and return field value reference.
+    public(friend) fun borrow_field_with_key_internal<Name: copy + drop + store, Value>(obj_id: ObjectID, field_key: address): (&Name, &Value) {
+        let df = native_borrow_field<DynamicField<Name, Value>>(obj_id, field_key);
+        (&df.name, &df.value)
+    }
+
     /// Acquire an immutable reference to the value which `key` maps to.
     /// Returns specified default value if there is no field for `key`.
     public fun borrow_field_with_default<T: key, Name: copy + drop + store, Value: store>(obj: &Object<T>, name: Name, default: &Value): &Value {
@@ -419,6 +508,13 @@ module moveos_std::object {
     public(friend) fun borrow_mut_field_internal<Name: copy + drop + store, Value>(obj_id: ObjectID, name: Name): &mut Value {
         let field_key = derive_field_key(name);
         &mut native_borrow_mut_field<DynamicField<Name, Value>>(obj_id, field_key).value
+    }
+
+    /// Obtain a mutable reference to the value associated with `field_key`.
+    /// Will abort if no field exists for the given `field_key`.
+    public(friend) fun borrow_mut_field_with_key_internal<Name: copy + drop + store, Value>(obj_id: ObjectID, field_key: address): (&Name, &mut Value) {
+        let df = native_borrow_mut_field<DynamicField<Name, Value>>(obj_id, field_key);
+        (&df.name, &mut df.value)
     }
 
     #[private_generics(T)]
@@ -471,7 +567,7 @@ module moveos_std::object {
         let DynamicField { name:_, value } = native_remove_field<DynamicField<Name, Value>>(obj_id, key);
         value
     }
-   
+
     /// Returns true if `object` contains an field for `key`, include normal field and object field
     public fun contains_field<T: key, Name: copy + drop + store>(obj: &Object<T>, name: Name): bool {
         contains_field_internal<Name>(obj.id, name)
@@ -491,6 +587,16 @@ module moveos_std::object {
     /// Returns the size of the object fields, the number of key-value pairs
     public fun field_size<T: key>(obj: &Object<T>): u64 {
         native_object_size(obj.id)
+    }
+
+    /// List all field names of the object
+    public(friend) fun list_field_keys<T: key, Name: copy + drop + store>(obj: &Object<T>, name: Option<Name>, limit: u64): vector<address> {
+        let cursor = if (option::is_some(&name)) {
+            option::some(derive_field_key(option::extract(&mut name)))
+        } else {
+            option::none()
+        };
+        native_list_field_keys(obj.id, cursor, limit)
     }
 
 
@@ -537,8 +643,10 @@ module moveos_std::object {
     native fun native_transfer_object<T: key>(obj: Object<T>, new_owner: address);
 
     native fun native_to_shared_object<T: key>(obj: Object<T>);
-    
+
     native fun native_to_frozen_object<T: key>(obj: Object<T>);
+
+    native fun native_clear_fields<T: key>(object_id: ObjectID);
 
     native fun native_borrow_object<T: key>(object_id: ObjectID): &Object<T>;
 
@@ -560,6 +668,30 @@ module moveos_std::object {
     native fun native_contains_field_with_value_type<V>(obj_id: ObjectID, key: address): bool;
 
     native fun native_remove_field<V>(obj_id: ObjectID, key: address): V;
+
+    native fun native_list_field_keys(obj_id: ObjectID, cursor: Option<address>, limit: u64): vector<address>;
+
+    // ===== Public Object metadata access functions =====
+
+    /// Get the creation timestamp of an object
+    public fun created_at(object_id: ObjectID): u64 {
+        native_object_created_at(object_id)
+    }
+
+    /// Get the last update timestamp of an object
+    public fun updated_at(object_id: ObjectID): u64 {
+        native_object_updated_at(object_id)
+    }
+
+    #[test_only]
+    public fun new_object_id_for_test(path: vector<address>): ObjectID {
+        ObjectID { path }
+    }
+
+    #[test_only]
+    public fun derive_object_id_for_test():ObjectID{
+        address_to_object_id(tx_context::fresh_address())
+    }
 
     #[test_only]
     /// Testing only: allows to drop a Object even if it's fields is not empty.
@@ -680,7 +812,7 @@ module moveos_std::object {
         let id = TestStructID { id: 1 };
         let object_id = custom_object_id<TestStructID, TestStruct>(id);
         //ensure the object_id is the same as the object_id generated by the object.rs
-        assert!(object_id.path == vector[@0xaa825038ae811f5c94d20175699d808eae4c624fa85c81faad45de1145284e06], 1);
+        assert!(object_id.path == vector[@0x6c62fde28fadbe652ba0eec95f5f096c900c94191a2debca96276b2de4b6ee3a], 1);
     }
 
     #[test]
@@ -751,7 +883,7 @@ module moveos_std::object {
             let _obj = borrow_mut_object<TestStruct>(alice, object_id);
         };
 
-        // borrow_mut_object by non-owner failed 
+        // borrow_mut_object by non-owner failed
         {
             let _obj = borrow_mut_object<TestStruct>(bob, object_id);
         };
@@ -954,6 +1086,22 @@ module moveos_std::object {
         let TestStruct2 { count: _ } = remove(child2);
     }
 
+    #[test]
+    fun test_child_object_with_same_id_remove_and_add_again(){
+        let parent = new(TestParent {});
+        let parent_id = id(&parent);
+        to_shared(parent);
+        let parent_ref = borrow_mut_object_shared<TestParent>(parent_id);
+        let id = 1u64;
+        let child1 = new_with_parent_and_id(parent_ref, id, TestStruct { count: 1 });
+        let child_id1 = id(&child1);
+        let TestStruct { count: _ } = remove(child1);
+        let child2 = new_with_parent_and_id(parent_ref, id, TestStruct { count: 2 });
+        let child_id2 = id(&child2);
+        assert!(child_id1 == child_id2, 1000);
+        let TestStruct { count: _ } = remove(child2);
+    }
+
     #[test_only]
     fun field_key_derive_test<Name: store + copy + drop>(name: Name, expect_result: address){
         let key = derive_field_key(name);
@@ -965,12 +1113,89 @@ module moveos_std::object {
         //test vector
         field_key_derive_test(b"1", @0x7301c6d045ed0df28fa129f5a825b210c8300eb0f44bb302e8a54b5eebeae13f);
         //test string
-        field_key_derive_test(std::string::utf8(b"1"), @0xc62df9a91eae549c2ff104f121549251c748185d0a21d5018c87db4be47fd191);
+        field_key_derive_test(std::string::utf8(b"1"), @0x5c01fed5cc173458597a3d55ec9942f1a385d5aa66f15e3615378d8a773e4d58);
         //test u8
         field_key_derive_test(1u8, @0x988ba0cd547556c2014c5e718b15fce912b95aa39db882de598b6ea841cde194);
         //test u64
         field_key_derive_test(1u64, @0x7eb4036673c8611e43c3eff1202446612f22a4b3bac92b7e14c0562ade5f1a3f);
         //test address
         field_key_derive_test(@0x1, @0x07d29b5cffb95d39f98baed1a973e676891bc9d379022aba6f4a2e4912a5e552);
+    }
+
+    #[test]
+    fun test_list_fields(){
+        use std::option;
+        let obj = new(TestStruct { count: 1 });
+        add_field(&mut obj, b"key1", 1u64);
+        add_field(&mut obj, b"key2", 2u64);
+
+        assert!(field_size(&obj) == 2, 1000);
+
+        let field_keys = list_field_keys<TestStruct, vector<u8>>(&obj, option::none(), 10);
+        std::debug::print(&field_keys);
+
+        assert!(!vector::is_empty(&field_keys), 1001);
+        assert!(vector::length(&field_keys) == 2, 1002);
+
+        let field_key1 = *vector::borrow(&field_keys, 0);
+        std::debug::print(&field_key1);
+
+        let field1 = native_borrow_field<DynamicField<vector<u8>, u64>>(obj.id, field_key1);
+        assert!(field1.name == b"key1", 1003);
+        assert!(field1.value == 1u64, 1004);
+
+        let field_key2 = *vector::borrow(&field_keys, 1);
+        std::debug::print(&field_key2);
+
+        let field2 = native_borrow_field<DynamicField<vector<u8>, u64>>(obj.id, field_key2);
+        assert!(field2.name == b"key2", 1005);
+        assert!(field2.value == 2u64, 1006);
+
+        let TestStruct{ count: _} = drop_unchecked(obj);
+    }
+
+    #[test]
+    fun test_object_id_to_string() {
+        let path = vector::empty<address>();
+        vector::push_back(&mut path, @0x1);
+        vector::push_back(&mut path, @0xa7afe75c4f3a7631191905601f4396b25dde044539807de65ed4fc7358dbd98e);
+
+        let id = ObjectID { path };
+        let str = to_string(&id);
+        // Expected: "0x0000000000000000000000000000000000000000000000000000000000000001a7afe75c4f3a7631191905601f4396b25dde044539807de65ed4fc7358dbd98e"
+        assert!(str == string::utf8(b"0x0000000000000000000000000000000000000000000000000000000000000001a7afe75c4f3a7631191905601f4396b25dde044539807de65ed4fc7358dbd98e"), 1000);
+        let from_id = from_string(&str);
+        assert!(id == from_id, 1001);
+
+        let id2 = ObjectID{path: vector[@0x1234]};
+        let str2 = to_string(&id2);
+        let from_id2 = from_string(&str2);
+        assert!(id2 == from_id2, 1002);
+    }
+
+    #[test]
+    fun test_object_id_from_string() {
+        // test empty string (root)
+        let root = from_string(&string::utf8(b""));
+        assert!(vector::is_empty(&root.path), 1010);
+
+        // test with "0x" prefix
+        // let id1 = from_string(&string::utf8(b"0x1234"));
+        let id1 = from_string(&string::utf8(b"0x0000000000000000000000000000000000000000000000000000000000001234"));
+        assert!(vector::length(&id1.path) == 1, 1011);
+
+        // test without prefix
+        let id2 = from_string(&string::utf8(b"1234"));
+        assert!(vector::length(&id2.path) == 1, 1012);
+    }
+
+    #[test]
+    fun test_remove_field_and_contains(){
+        let obj = new(TestStruct { count: 1 });
+        add_field(&mut obj, b"key", 1u64);
+        assert!(contains_field(&obj, b"key"), 1000);
+        let _v:u64 = remove_field(&mut obj, b"key");
+        assert!(!contains_field(&obj, b"key"), 1001);
+        let TestStruct{ count: _} = remove(obj);
     }
 }

@@ -77,6 +77,15 @@ Information about the transaction currently being executed.
 
 
 
+<a name="0x2_tx_context_ErrorRepeatedContextKey"></a>
+
+
+
+<pre><code><b>const</b> <a href="tx_context.md#0x2_tx_context_ErrorRepeatedContextKey">ErrorRepeatedContextKey</a>: u64 = 2;
+</code></pre>
+
+
+
 <a name="0x2_tx_context_sender"></a>
 
 ## Function `sender`
@@ -120,7 +129,7 @@ Return the max gas to be used
 Generate a new unique address,
 
 
-<pre><code><b>public</b>(<b>friend</b>) <b>fun</b> <a href="tx_context.md#0x2_tx_context_fresh_address">fresh_address</a>(): <b>address</b>
+<pre><code><b>public</b> <b>fun</b> <a href="tx_context.md#0x2_tx_context_fresh_address">fresh_address</a>(): <b>address</b>
 </code></pre>
 
 
@@ -189,7 +198,7 @@ Check if the key is in the context map
 ## Function `tx_meta`
 
 Get the transaction meta data
-The TxMeta is writed by the VM before the transaction execution.
+The TxMeta is written by the VM before the transaction execution.
 The meta data is only available when executing or validating a transaction, otherwise abort(eg. readonly function call).
 
 

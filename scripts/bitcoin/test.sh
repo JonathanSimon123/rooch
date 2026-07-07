@@ -53,15 +53,15 @@ export RUST_LOG=debug
 export RUST_BACKTRACE=1
 
 if [ ! -z "$UNIT_TEST" ]; then
-  cargo run --bin rooch move test -p frameworks/rooch-nursery bitseed 
+  cargo run --bin rooch move test -p frameworks/rooch-framework simple_rng 
 fi
 
 if [ ! -z "$WASM_INT_TEST" ]; then
-  cargo test -p testsuite --test integration -- --name "wasm test"
+  cargo test -p testsuite --test integration -- --name "cosmwasm-vm test"
 fi
 
 if [ ! -z "$BITCOIN_INT_TEST" ]; then
-  cargo test -p testsuite --test integration -- --name "rooch_bitcoin test"
+  cargo test -p testsuite --test integration -- --name "rooch bitcoin api test"
 fi
 
 if [ ! -z "$ORD_INT_TEST" ]; then

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 module rooch_framework::bitcoin_address {
+    use std::option::{Self, Option};
     use std::vector;
     use std::string::{Self, String};
 
@@ -14,7 +15,12 @@ module rooch_framework::bitcoin_address {
     const P2SH_ADDR_BYTE_LEN: u64 = 21;
 
     // error code
-    const ErrorAddressBytesLen: u64 = 1;
+    const ErrorInvalidAddress: u64 = 1;
+    const ErrorArgNotVectorU8: u64 = 2;
+    const ErrorInvalidPublicKey: u64 = 3;
+    const ErrorInvalidThreshold: u64 = 4;
+    const ErrorInvalidKeyEggContext: u64 = 5;
+    const ErrorDeprecated: u64 = 6;
 
     // P2PKH address decimal prefix
     const P2PKH_ADDR_DECIMAL_PREFIX_MAIN: u8 = 0; // 0x00
@@ -23,6 +29,18 @@ module rooch_framework::bitcoin_address {
     const P2SH_ADDR_DECIMAL_PREFIX_MAIN: u8 = 5; // 0x05
     const P2SH_ADDR_DECIMAL_PREFIX_TEST: u8 = 196; // 0xc4
 
+    const PAY_LOAD_TYPE_PUBKEY_HASH: u8 = 0;
+    public fun pay_load_type_pubkey_hash(): u8 {
+        PAY_LOAD_TYPE_PUBKEY_HASH
+    }
+    const PAY_LOAD_TYPE_SCRIPT_HASH: u8 = 1;
+    public fun pay_load_type_script_hash(): u8 {
+        PAY_LOAD_TYPE_SCRIPT_HASH
+    }
+    const PAY_LOAD_TYPE_WITNESS_PROGRAM: u8 = 2;
+    public fun pay_load_type_witness_program(): u8 {
+        PAY_LOAD_TYPE_WITNESS_PROGRAM
+    }
    
     #[data_struct]
     /// BitcoinAddress is a struct that represents a Bitcoin address.
@@ -31,29 +49,29 @@ module rooch_framework::bitcoin_address {
         bytes: vector<u8>,
     }
 
-    public fun new_p2pkh(pubkey_hash: vector<u8>): BitcoinAddress{
-        assert!(vector::length(&pubkey_hash) == PUBKEY_HASH_LEN, ErrorAddressBytesLen);
+    public fun p2pkh(pubkey_hash: vector<u8>): BitcoinAddress{
+        assert!(vector::length(&pubkey_hash) == PUBKEY_HASH_LEN, ErrorInvalidAddress);
         //we do not distinguish between mainnet and testnet in Move
-        let bytes = vector::singleton<u8>(P2PKH_ADDR_DECIMAL_PREFIX_MAIN);
+        let bytes = vector::singleton<u8>(PAY_LOAD_TYPE_PUBKEY_HASH);
         vector::append(&mut bytes, pubkey_hash);
         BitcoinAddress {
             bytes: bytes,
         }
     }
 
-    public fun new_p2sh(script_hash: vector<u8>): BitcoinAddress{
-        assert!(vector::length(&script_hash) == SCRIPT_HASH_LEN, ErrorAddressBytesLen);
-        let bytes = vector::singleton<u8>(P2SH_ADDR_DECIMAL_PREFIX_MAIN);
+    public fun p2sh(script_hash: vector<u8>): BitcoinAddress{
+        assert!(vector::length(&script_hash) == SCRIPT_HASH_LEN, ErrorInvalidAddress);
+        let bytes = vector::singleton<u8>(PAY_LOAD_TYPE_SCRIPT_HASH);
         vector::append(&mut bytes, script_hash);
         BitcoinAddress {
             bytes: bytes,
         }
     }
 
-    public fun new_witness_program(program: vector<u8>): BitcoinAddress{
-        BitcoinAddress {
-            bytes: program,
-        }
+    /// Derive a Bitcoin address from a internal public key and a merkle root.
+    /// The internal public key is a secp256k1 public key or x-only public key.
+    public fun p2tr(internal_pubkey: &vector<u8>, merkle_root: Option<address>): BitcoinAddress {
+        derive_bitcoin_taproot_address(internal_pubkey, merkle_root)
     }
 
     public(friend) fun new(bytes: vector<u8>): BitcoinAddress {
@@ -62,14 +80,28 @@ module rooch_framework::bitcoin_address {
         }
     }
 
+    public fun empty() : BitcoinAddress {
+        BitcoinAddress {
+            bytes: vector::empty()
+        }
+    }
+
+    public fun pay_load_type(addr: &BitcoinAddress): u8 {
+        *vector::borrow(&addr.bytes, 0)
+    }
+
+    public fun pay_load(addr: &BitcoinAddress): vector<u8> {
+        vector::slice(&addr.bytes, 1, vector::length(&addr.bytes))
+    }
+
     public fun is_p2pkh(addr: &BitcoinAddress): bool {
         let bytes = &addr.bytes;
-        vector::length(bytes) == P2PKH_ADDR_BYTE_LEN && *vector::borrow(bytes, 0) == P2PKH_ADDR_DECIMAL_PREFIX_MAIN
+        vector::length(bytes) == P2PKH_ADDR_BYTE_LEN && *vector::borrow(bytes, 0) == PAY_LOAD_TYPE_PUBKEY_HASH
     }
 
     public fun is_p2sh(addr: &BitcoinAddress): bool {
         let bytes = &addr.bytes;
-        vector::length(bytes) == P2SH_ADDR_BYTE_LEN && *vector::borrow(bytes, 0) == P2SH_ADDR_DECIMAL_PREFIX_MAIN
+        vector::length(bytes) == P2SH_ADDR_BYTE_LEN && *vector::borrow(bytes, 0) == PAY_LOAD_TYPE_SCRIPT_HASH
     }
 
     public fun is_witness_program(addr: &BitcoinAddress): bool {
@@ -96,27 +128,40 @@ module rooch_framework::bitcoin_address {
     }
 
     public fun verify_with_public_key(addr: &String, pk: &vector<u8>): bool {
-        let raw_bytes = string::bytes(addr);
-        verify_with_pk(raw_bytes, pk)
+        let bitcoin_addr = from_string(addr);
+        verify_bitcoin_address_with_public_key(&bitcoin_addr, pk)
     }
 
     public fun to_rooch_address(addr: &BitcoinAddress): address{
+        assert!(!is_empty(addr), ErrorInvalidAddress);
         let hash = moveos_std::hash::blake2b256(&addr.bytes);
         moveos_std::bcs::to_address(hash)
     }
 
+    native fun derive_bitcoin_taproot_address(internal_pubkey: &vector<u8>, merkle_root: Option<address>) : BitcoinAddress;
+
+    /// verify bitcoin address according to the pk bytes, the pk is Secp256k1 public key format.
+    public native fun verify_bitcoin_address_with_public_key(bitcoin_addr: &BitcoinAddress, pk: &vector<u8>): bool;
+
+ 
+    // derive bitcoin taproot address from a secp256k1 pubkey or x-only pubkey
+    public fun derive_bitcoin_taproot_address_from_pubkey(pubkey: &vector<u8>): BitcoinAddress{
+        derive_bitcoin_taproot_address(pubkey, option::none())
+    }
+    
     /// Parse the Bitcoin address string bytes to Move BitcoinAddress
     native fun parse(raw_addr: &vector<u8>): BitcoinAddress;
-    native fun verify_with_pk (addr: &vector<u8>, pk: &vector<u8>): bool;
 
     #[test_only]
     public fun random_address_for_testing(): BitcoinAddress {
         let bytes = moveos_std::bcs::to_bytes(&moveos_std::tx_context::fresh_address_for_testing());
-        new_witness_program(bytes)
+        BitcoinAddress{
+            bytes
+        }
     }
 
     #[test]
-    fun test_verify_with_pk_success() {
+    fun test_verify_with_public_key_success() {
         // p2tr
         let addr = string::utf8(b"bc1p8xpjpkc9uzj2dexcxjg9sw8lxje85xa4070zpcys589e3rf6k20qm6gjrt");
         let pk = x"038e3d29b653e40f5b620f9443ee05222d1e40be58f544b6fed3d464edd54db883";
@@ -141,8 +186,38 @@ module rooch_framework::bitcoin_address {
 
     #[test]
     fun test_validate_signature_fail() {
-        let addr = string::utf8(b"ac1p8xpjpkc9uzj2dexcxjg9sw8lxje85xa4070zpcys589e3rf6k20qm6gjrt");
-        let pk = x"038e3d29b653e40f5b620f9443ee05222d1e40be58f544b6fed3d464edd54db883";
+        let addr = string::utf8(b"bc1p8xpjpkc9uzj2dexcxjg9sw8lxje85xa4070zpcys589e3rf6k20qm6gjrt");
+        let pk = x"038e3d29b653e40f5b620f9443ee05222d1e40be58f544b6fed3d464edd54db884";
         assert!(!verify_with_public_key(&addr, &pk), 1004);
+    }
+
+    #[test]
+    fun test_derive_bitcoin_taproot_address_from_pubkey_success() {
+        let pubkey = x"034cdb7426f6cebd2e69630c5214fac8dee6a999b43b22907d1d8e4a9363a96a14";
+
+        let bitcoin_addr = derive_bitcoin_taproot_address_from_pubkey(&pubkey);
+
+        let expected_bitcoin_addr = from_string(&string::utf8(b"bc1p72fvqwm9w4wcsd205maky9qejf6dwa6qeku5f5vnu4phpp3vvpws0p2f4g"));
+
+        assert!(expected_bitcoin_addr.bytes == bitcoin_addr.bytes, ErrorInvalidPublicKey);
+    }
+
+    #[test]
+    fun test_derive_bitcoin_taproot_address_from_x_only_pubkey_success() {
+        let pubkey = x"4cdb7426f6cebd2e69630c5214fac8dee6a999b43b22907d1d8e4a9363a96a14";
+
+        let bitcoin_addr = derive_bitcoin_taproot_address_from_pubkey(&pubkey);
+
+        let expected_bitcoin_addr = from_string(&string::utf8(b"bc1p72fvqwm9w4wcsd205maky9qejf6dwa6qeku5f5vnu4phpp3vvpws0p2f4g"));
+
+        assert!(expected_bitcoin_addr.bytes == bitcoin_addr.bytes, ErrorInvalidPublicKey);
+    }
+
+    #[test]
+    #[expected_failure(location=Self, abort_code = ErrorInvalidPublicKey)]
+    fun test_derive_bitcoin_taproot_address_from_multisig_pubkey_fail() {
+        let pubkey = x"3d29b653e40f5b620f9443ee05222d1e40be58f544b6fed3d464edd54db883";
+
+        derive_bitcoin_taproot_address_from_pubkey(&pubkey);
     }
 }

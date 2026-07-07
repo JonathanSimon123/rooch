@@ -1,0 +1,152 @@
+# Development Base Image for Rooch
+# This image provides a complete development environment for Rooch, including:
+# - Rust/Move build toolchain
+# - Node.js and pnpm for TypeScript SDK development
+# - bitcoind for local regtest testing
+# - SQLite with thread-safe configuration
+#
+# Usage:
+#   docker build -f docker/DockerfileDevBase -t rooch-dev-base:latest .
+#   docker run -it rooch-dev-base:latest bash
+
+FROM ubuntu:jammy
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Set working directory
+WORKDIR /rooch
+
+# Install base dependencies
+RUN set -eux; \
+    apt-get update || (sleep 10 && apt-get update); \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        gcc \
+        libc6-dev \
+        git \
+        libssl-dev \
+        wget \
+        curl \
+        pkg-config \
+        libclang-dev \
+        clang \
+        llvm \
+        lld \
+        libsnappy-dev \
+        g++ \
+        cmake \
+        make \
+        libprotobuf-dev \
+        protobuf-compiler \
+        build-essential \
+        libreadline-dev \
+        libevent-dev \
+        gpg || (sleep 10 && apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        gcc \
+        libc6-dev \
+        git \
+        libssl-dev \
+        wget \
+        curl \
+        pkg-config \
+        libclang-dev \
+        clang \
+        llvm \
+        lld \
+        libsnappy-dev \
+        g++ \
+        cmake \
+        make \
+        libprotobuf-dev \
+        protobuf-compiler \
+        build-essential \
+        libreadline-dev \
+        libevent-dev \
+        gpg); \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Bitcoin Core 25.1 (matching test container version)
+# Using official binary release from bitcoincore.org
+RUN set -eux; \
+    BITCOIN_VERSION="25.1"; \
+    BITCOIN_DIR="bitcoin-${BITCOIN_VERSION}"; \
+    BITCOIN_FILE="bitcoin-${BITCOIN_VERSION}-x86_64-linux-gnu.tar.gz"; \
+    wget https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_VERSION}/${BITCOIN_FILE}; \
+    wget https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_VERSION}/SHA256SUMS; \
+    echo "a978c407b497a727f0444156e397b50491ce862d1f906fef9b521415b3611c8b  ${BITCOIN_FILE}" | sha256sum -c -; \
+    tar -xzf ${BITCOIN_FILE}; \
+    install -m 0755 ${BITCOIN_DIR}/bin/bitcoind /usr/local/bin/bitcoind; \
+    install -m 0755 ${BITCOIN_DIR}/bin/bitcoin-cli /usr/local/bin/bitcoin-cli; \
+    install -m 0755 ${BITCOIN_DIR}/bin/bitcoin-tx /usr/local/bin/bitcoin-tx; \
+    install -m 0755 ${BITCOIN_DIR}/bin/bitcoin-util /usr/local/bin/bitcoin-util; \
+    install -m 0755 ${BITCOIN_DIR}/bin/bitcoin-wallet /usr/local/bin/bitcoin-wallet; \
+    rm -rf ${BITCOIN_DIR} ${BITCOIN_FILE} SHA256SUMS; \
+    bitcoind --version
+
+# Install SQLite 3.46.1 with multi-threading enabled (SQLITE_THREADSAFE=2)
+# This matches the build approach used in the production Dockerfile
+# SHA256 checksum verified for security
+RUN set -eux; \
+    SQLITE_VERSION="3460100"; \
+    wget https://www.sqlite.org/2024/sqlite-autoconf-${SQLITE_VERSION}.tar.gz; \
+    echo "67d3fe6d268e6eaddcae3727fce58fcc8e9c53869bdd07a0c61e38ddf2965071  sqlite-autoconf-${SQLITE_VERSION}.tar.gz" | sha256sum -c -; \
+    tar xvf sqlite-autoconf-${SQLITE_VERSION}.tar.gz; \
+    cd sqlite-autoconf-${SQLITE_VERSION}; \
+    CFLAGS="-DSQLITE_THREADSAFE=2" ./configure --prefix=/usr/local; \
+    make; \
+    make install; \
+    cd ..; \
+    rm -rf sqlite-autoconf-${SQLITE_VERSION} sqlite-autoconf-${SQLITE_VERSION}.tar.gz; \
+    ldconfig
+
+# Install Rust 1.91.1 (matching rust-toolchain.toml)
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:/usr/local/bin:$PATH
+
+RUN set -eux; \
+    RUSTUP_INIT_VERSION="1.91.1"; \
+    url="https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init"; \
+    wget "$url"; \
+    chmod +x rustup-init; \
+    ./rustup-init -y --no-modify-path --default-toolchain ${RUSTUP_INIT_VERSION} --profile minimal; \
+    rm rustup-init; \
+    chmod -R a+w $RUSTUP_HOME $CARGO_HOME; \
+    rustup --version; \
+    cargo --version; \
+    rustc --version
+
+# Install Node.js 20.x (satisfies >=20 requirement)
+RUN set -eux; \
+    install -m 0755 -d /etc/apt/keyrings; \
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg; \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" > /etc/apt/sources.list.d/nodesource.list; \
+    apt-get update; \
+    apt-get install -y nodejs; \
+    rm -rf /var/lib/apt/lists/*; \
+    node --version; \
+    npm --version
+
+# Install pnpm 9.10.0 (matching root package.json)
+RUN set -eux; \
+    npm install -g pnpm@9.10.0; \
+    pnpm --version
+
+# Install libssl1.1 for compatibility
+# Using official Ubuntu security repository with HTTPS and checksum verification
+RUN set -eux; \
+    LIBSSL_DEB="libssl1.1_1.1.1f-1ubuntu2.24_amd64.deb"; \
+    LIBSSL_URL="https://security.ubuntu.com/ubuntu/pool/main/o/openssl/${LIBSSL_DEB}"; \
+    LIBSSL_SHA256="7cf39d70a639017d1dd7c8d36daa2258063608688e449fddf40ffdd46f992a78"; \
+    wget "${LIBSSL_URL}"; \
+    echo "${LIBSSL_SHA256}  ${LIBSSL_DEB}" | sha256sum -c -; \
+    dpkg -i "${LIBSSL_DEB}"; \
+    rm "${LIBSSL_DEB}"
+
+# Set up a convenient default workspace
+VOLUME ["/rooch"]
+
+# Default to bash shell
+CMD ["/bin/bash"]

@@ -63,6 +63,9 @@ the return on investment didn't seem worth it for these simple functions.
 -  [Function `any`](#0x1_vector_any)
 -  [Function `all`](#0x1_vector_all)
 -  [Function `destroy`](#0x1_vector_destroy)
+-  [Function `range`](#0x1_vector_range)
+-  [Function `range_with_step`](#0x1_vector_range_with_step)
+-  [Function `slice`](#0x1_vector_slice)
 -  [Module Specification](#@Module_Specification_1)
 
 
@@ -80,7 +83,7 @@ the return on investment didn't seem worth it for these simple functions.
 The index into the vector is out of bounds
 
 
-<pre><code><b>const</b> <a href="vector.md#0x1_vector_EINDEX_OUT_OF_BOUNDS">EINDEX_OUT_OF_BOUNDS</a>: u64 = 131072;
+<pre><code><b>const</b> <a href="vector.md#0x1_vector_EINDEX_OUT_OF_BOUNDS">EINDEX_OUT_OF_BOUNDS</a>: <a href="u64.md#0x1_u64">u64</a> = 131072;
 </code></pre>
 
 
@@ -90,7 +93,27 @@ The index into the vector is out of bounds
 The index into the vector is out of bounds
 
 
-<pre><code><b>const</b> <a href="vector.md#0x1_vector_EINVALID_RANGE">EINVALID_RANGE</a>: u64 = 131073;
+<pre><code><b>const</b> <a href="vector.md#0x1_vector_EINVALID_RANGE">EINVALID_RANGE</a>: <a href="u64.md#0x1_u64">u64</a> = 131073;
+</code></pre>
+
+
+
+<a name="0x1_vector_EINVALID_SLICE_RANGE"></a>
+
+The range in <code>slice</code> is invalid.
+
+
+<pre><code><b>const</b> <a href="vector.md#0x1_vector_EINVALID_SLICE_RANGE">EINVALID_SLICE_RANGE</a>: <a href="u64.md#0x1_u64">u64</a> = 131076;
+</code></pre>
+
+
+
+<a name="0x1_vector_EINVALID_STEP"></a>
+
+The step provided in <code>range</code> is invalid, must be greater than zero.
+
+
+<pre><code><b>const</b> <a href="vector.md#0x1_vector_EINVALID_STEP">EINVALID_STEP</a>: <a href="u64.md#0x1_u64">u64</a> = 131075;
 </code></pre>
 
 
@@ -100,7 +123,7 @@ The index into the vector is out of bounds
 The length of the vectors are not equal.
 
 
-<pre><code><b>const</b> <a href="vector.md#0x1_vector_EVECTORS_LENGTH_MISMATCH">EVECTORS_LENGTH_MISMATCH</a>: u64 = 131074;
+<pre><code><b>const</b> <a href="vector.md#0x1_vector_EVECTORS_LENGTH_MISMATCH">EVECTORS_LENGTH_MISMATCH</a>: <a href="u64.md#0x1_u64">u64</a> = 131074;
 </code></pre>
 
 
@@ -126,7 +149,7 @@ Return the length of the vector.
 
 
 <pre><code>#[bytecode_instruction]
-<b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_length">length</a>&lt;Element&gt;(v: &<a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;): u64
+<b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_length">length</a>&lt;Element&gt;(v: &<a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;): <a href="u64.md#0x1_u64">u64</a>
 </code></pre>
 
 
@@ -140,7 +163,7 @@ Aborts if <code>i</code> is out of bounds.
 
 
 <pre><code>#[bytecode_instruction]
-<b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_borrow">borrow</a>&lt;Element&gt;(v: &<a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, i: u64): &Element
+<b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_borrow">borrow</a>&lt;Element&gt;(v: &<a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, i: <a href="u64.md#0x1_u64">u64</a>): &Element
 </code></pre>
 
 
@@ -167,7 +190,7 @@ Aborts if <code>i</code> is out of bounds.
 
 
 <pre><code>#[bytecode_instruction]
-<b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_borrow_mut">borrow_mut</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, i: u64): &<b>mut</b> Element
+<b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_borrow_mut">borrow_mut</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, i: <a href="u64.md#0x1_u64">u64</a>): &<b>mut</b> Element
 </code></pre>
 
 
@@ -209,7 +232,7 @@ Aborts if <code>i</code> or <code>j</code> is out of bounds.
 
 
 <pre><code>#[bytecode_instruction]
-<b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_swap">swap</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, i: u64, j: u64)
+<b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_swap">swap</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, i: <a href="u64.md#0x1_u64">u64</a>, j: <a href="u64.md#0x1_u64">u64</a>)
 </code></pre>
 
 
@@ -245,7 +268,7 @@ Reverses the order of the elements in the vector <code>v</code> in place.
 Reverses the order of the elements [left, right) in the vector <code>v</code> in place.
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_reverse_slice">reverse_slice</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, left: u64, right: u64)
+<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_reverse_slice">reverse_slice</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, left: <a href="u64.md#0x1_u64">u64</a>, right: <a href="u64.md#0x1_u64">u64</a>)
 </code></pre>
 
 
@@ -280,7 +303,7 @@ Pushes all of the elements of the <code>other</code> vector into the <code>lhs</
 Trim a vector to a smaller size, returning the evicted elements in order
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_trim">trim</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, new_len: u64): <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;
+<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_trim">trim</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, new_len: <a href="u64.md#0x1_u64">u64</a>): <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;
 </code></pre>
 
 
@@ -292,7 +315,7 @@ Trim a vector to a smaller size, returning the evicted elements in order
 Trim a vector to a smaller size, returning the evicted elements in reverse order
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_trim_reverse">trim_reverse</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, new_len: u64): <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;
+<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_trim_reverse">trim_reverse</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, new_len: <a href="u64.md#0x1_u64">u64</a>): <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;
 </code></pre>
 
 
@@ -329,7 +352,7 @@ Return <code>(<b>true</b>, i)</code> if <code>e</code> is in the vector <code>v<
 Otherwise, returns <code>(<b>false</b>, 0)</code>.
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_index_of">index_of</a>&lt;Element&gt;(v: &<a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, e: &Element): (bool, u64)
+<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_index_of">index_of</a>&lt;Element&gt;(v: &<a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, e: &Element): (bool, <a href="u64.md#0x1_u64">u64</a>)
 </code></pre>
 
 
@@ -343,7 +366,7 @@ the predicate, only the index of the first one is returned.
 Otherwise, returns <code>(<b>false</b>, 0)</code>.
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_find">find</a>&lt;Element&gt;(v: &<a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, f: |&Element|bool): (bool, u64)
+<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_find">find</a>&lt;Element&gt;(v: &<a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, f: |&Element|bool): (bool, <a href="u64.md#0x1_u64">u64</a>)
 </code></pre>
 
 
@@ -356,7 +379,7 @@ Insert a new element at position 0 <= i <= length, using O(length - i) time.
 Aborts if out of bounds.
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_insert">insert</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, i: u64, e: Element)
+<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_insert">insert</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, i: <a href="u64.md#0x1_u64">u64</a>, e: Element)
 </code></pre>
 
 
@@ -370,7 +393,7 @@ This is O(n) and preserves ordering of elements in the vector.
 Aborts if <code>i</code> is out of bounds.
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_remove">remove</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, i: u64): Element
+<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_remove">remove</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, i: <a href="u64.md#0x1_u64">u64</a>): Element
 </code></pre>
 
 
@@ -401,7 +424,7 @@ This is O(1), but does not preserve ordering of elements in the vector.
 Aborts if <code>i</code> is out of bounds.
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_swap_remove">swap_remove</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, i: u64): Element
+<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_swap_remove">swap_remove</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, i: <a href="u64.md#0x1_u64">u64</a>): Element
 </code></pre>
 
 
@@ -487,7 +510,7 @@ This errors out if the vectors are not of the same length.
 Apply the function to a reference of each element in the vector with its index.
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_enumerate_ref">enumerate_ref</a>&lt;Element&gt;(v: &<a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, f: |(u64, &Element)|())
+<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_enumerate_ref">enumerate_ref</a>&lt;Element&gt;(v: &<a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, f: |(<a href="u64.md#0x1_u64">u64</a>, &Element)|())
 </code></pre>
 
 
@@ -524,7 +547,7 @@ This errors out if the vectors are not of the same length.
 Apply the function to a mutable reference of each element in the vector with its index.
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_enumerate_mut">enumerate_mut</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, f: |(u64, &<b>mut</b> Element)|())
+<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_enumerate_mut">enumerate_mut</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, f: |(<a href="u64.md#0x1_u64">u64</a>, &<b>mut</b> Element)|())
 </code></pre>
 
 
@@ -626,7 +649,7 @@ Preserves the relative order of the elements for which pred is true,
 BUT NOT for the elements for which pred is false.
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_partition">partition</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, pred: |&Element|bool): u64
+<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_partition">partition</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, pred: |&Element|bool): <a href="u64.md#0x1_u64">u64</a>
 </code></pre>
 
 
@@ -639,7 +662,7 @@ rotate(&mut [1, 2, 3, 4, 5], 2) -> [3, 4, 5, 1, 2] in place, returns the split p
 ie. 3 in the example above
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_rotate">rotate</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, rot: u64): u64
+<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_rotate">rotate</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, rot: <a href="u64.md#0x1_u64">u64</a>): <a href="u64.md#0x1_u64">u64</a>
 </code></pre>
 
 
@@ -652,7 +675,7 @@ Same as above but on a sub-slice of an array [left, right) with left <= rot <= r
 returns the
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_rotate_slice">rotate_slice</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, left: u64, rot: u64, right: u64): u64
+<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_rotate_slice">rotate_slice</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, left: <a href="u64.md#0x1_u64">u64</a>, rot: <a href="u64.md#0x1_u64">u64</a>, right: <a href="u64.md#0x1_u64">u64</a>): <a href="u64.md#0x1_u64">u64</a>
 </code></pre>
 
 
@@ -665,7 +688,7 @@ Partition the array based on a predicate p, this routine is stable and thus
 preserves the relative order of the elements in the two partitions.
 
 
-<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_stable_partition">stable_partition</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, p: |&Element|bool): u64
+<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_stable_partition">stable_partition</a>&lt;Element&gt;(v: &<b>mut</b> <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, p: |&Element|bool): <a href="u64.md#0x1_u64">u64</a>
 </code></pre>
 
 
@@ -703,6 +726,39 @@ when used in the context of destroying a vector.
 
 
 <pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_destroy">destroy</a>&lt;Element&gt;(v: <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, d: |Element|())
+</code></pre>
+
+
+
+<a name="0x1_vector_range"></a>
+
+## Function `range`
+
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_range">range</a>(start: <a href="u64.md#0x1_u64">u64</a>, end: <a href="u64.md#0x1_u64">u64</a>): <a href="vector.md#0x1_vector">vector</a>&lt;<a href="u64.md#0x1_u64">u64</a>&gt;
+</code></pre>
+
+
+
+<a name="0x1_vector_range_with_step"></a>
+
+## Function `range_with_step`
+
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_range_with_step">range_with_step</a>(start: <a href="u64.md#0x1_u64">u64</a>, end: <a href="u64.md#0x1_u64">u64</a>, step: <a href="u64.md#0x1_u64">u64</a>): <a href="vector.md#0x1_vector">vector</a>&lt;<a href="u64.md#0x1_u64">u64</a>&gt;
+</code></pre>
+
+
+
+<a name="0x1_vector_slice"></a>
+
+## Function `slice`
+
+
+
+<pre><code><b>public</b> <b>fun</b> <a href="vector.md#0x1_vector_slice">slice</a>&lt;Element: <b>copy</b>&gt;(self: &<a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;, start: <a href="u64.md#0x1_u64">u64</a>, end: <a href="u64.md#0x1_u64">u64</a>): <a href="vector.md#0x1_vector">vector</a>&lt;Element&gt;
 </code></pre>
 
 

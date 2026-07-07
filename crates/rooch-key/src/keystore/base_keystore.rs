@@ -3,9 +3,10 @@
 
 use super::types::{LocalAccount, LocalSessionKey};
 use crate::keystore::account_keystore::AccountKeystore;
-use anyhow::ensure;
+use anyhow::{ensure, Ok};
 use rooch_types::framework::session_key::SessionKey;
 use rooch_types::key_struct::{MnemonicData, MnemonicResult};
+use rooch_types::to_bech32::ToBech32;
 use rooch_types::{
     address::RoochAddress,
     authentication_key::AuthenticationKey,
@@ -74,10 +75,12 @@ impl AccountKeystore for BaseKeyStore {
             let keypair: RoochKeyPair = encryption.decrypt_with_type(password.clone())?;
             let public_key = keypair.public();
             let bitcoin_address = public_key.bitcoin_address()?;
+            let nostr_bech32_public_key = public_key.xonly_public_key()?.to_bech32()?;
             let has_session_key = self.session_keys.contains_key(address);
             let local_account = LocalAccount {
                 address: *address,
                 bitcoin_address,
+                nostr_bech32_public_key,
                 public_key,
                 has_session_key,
             };
@@ -86,6 +89,11 @@ impl AccountKeystore for BaseKeyStore {
         Ok(accounts.into_values().collect())
     }
 
+    fn contains_address(&self, address: &RoochAddress) -> bool {
+        self.keys.contains_key(address)
+    }
+
+    // TODO: deal with the Rooch and Nostr's get_key_pair() function. Consider Nostr scenario
     fn get_key_pair(
         &self,
         address: &RoochAddress,
@@ -95,10 +103,9 @@ impl AccountKeystore for BaseKeyStore {
             let keypair: RoochKeyPair = encryption.decrypt_with_type::<RoochKeyPair>(password)?;
             Ok(keypair)
         } else {
-            Err(anyhow::Error::new(RoochError::SignMessageError(format!(
-                "Cannot find key for address: [{:?}]",
-                address
-            ))))
+            Err(anyhow::Error::new(RoochError::CommandArgumentError(
+                format!("Cannot find key for address: [{:?}]", address),
+            )))
         }
     }
 
@@ -150,6 +157,20 @@ impl AccountKeystore for BaseKeyStore {
 
     fn nullify(&mut self, address: &RoochAddress) -> Result<(), anyhow::Error> {
         self.keys.remove(address);
+        let mnemonic_data = match &self.mnemonic {
+            Some(mnemonic) => mnemonic,
+            // For None, this could be indicating that there's no internal account address in the mnemonic addresses
+            None => return Ok(()),
+        };
+        match mnemonic_data
+            .addresses
+            .iter()
+            .position(|&target_address| target_address == *address)
+        {
+            Some(index) => self.mnemonic.as_mut().unwrap().addresses.remove(index),
+            // For None, this could be either non-existing address in keystore or the external account address
+            None => return Ok(()),
+        };
         Ok(())
     }
 
@@ -212,13 +233,26 @@ impl AccountKeystore for BaseKeyStore {
             .decrypt_with_type(password)
             .map_err(signature::Error::from_source)?;
 
-        let auth = authenticator::Authenticator::rooch(&kp, &msg);
+        let auth = authenticator::Authenticator::session(&kp, &msg);
         Ok(RoochTransaction::new(msg, auth))
+    }
+
+    fn get_session_key(
+        &self,
+        address: &RoochAddress,
+        authentication_key: &AuthenticationKey,
+        password: Option<String>,
+    ) -> Result<Option<RoochKeyPair>, anyhow::Error> {
+        Ok(self.session_keys.get(address).ok_or_else(|| {
+            anyhow::Error::new(RoochError::KeyConversionError(format!("Cannot find session key for address:[{address}] and authentication_key:[{authentication_key}]", address = address, authentication_key = authentication_key)))
+        })?
+        .get(authentication_key)
+        .map(|local_session_key| local_session_key.private_key.decrypt_with_type(password).map_err(signature::Error::from_source)).transpose()?)
     }
 
     fn addresses(&self) -> Vec<RoochAddress> {
         // Create an empty Vec to store the addresses.
-        let mut addresses = Vec::new();
+        let mut addresses = Vec::with_capacity(self.keys.len() + self.session_keys.len());
 
         // Iterate over the `keys` and `session_keys` BTreeMaps.
         for key in self.keys.keys() {

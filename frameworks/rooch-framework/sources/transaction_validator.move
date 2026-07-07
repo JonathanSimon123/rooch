@@ -9,6 +9,7 @@ module rooch_framework::transaction_validator {
     use moveos_std::tx_result;
     use moveos_std::account;
     use moveos_std::gas_schedule;
+    use moveos_std::tx_meta;
     use rooch_framework::account as account_entry;
     use rooch_framework::account_authentication;
     use rooch_framework::auth_validator::{Self, TxValidateResult};
@@ -17,14 +18,22 @@ module rooch_framework::transaction_validator {
     use rooch_framework::chain_id;
     use rooch_framework::transaction_fee;
     use rooch_framework::gas_coin;
+    use rooch_framework::transaction_gas;
     use rooch_framework::transaction::{Self, TransactionSequenceInfo};
     use rooch_framework::session_validator;
     use rooch_framework::bitcoin_validator;
     use rooch_framework::address_mapping;
+    use rooch_framework::account_coin_store;
+    use rooch_framework::builtin_validators;
+    use rooch_framework::onchain_config;
+    use rooch_framework::coin;
+    use rooch_framework::bitcoin_address;
+    use rooch_framework::webauthn_validator;
+    use rooch_framework::did_validator;
 
     const MAX_U64: u128 = 18446744073709551615;
 
-
+    
     /// Just using to get module signer
     struct TransactionValidatorPlaceholder {}
 
@@ -66,19 +75,19 @@ module rooch_framework::transaction_validator {
         let max_gas_amount = tx_context::max_gas_amount();
         let gas = transaction_fee::calculate_gas(max_gas_amount);
 
-        let gas_schedule = gas_schedule::gas_schedule();
-        let max_gas_amount_config = gas_schedule::gas_schedule_max_gas_amount(gas_schedule);
+        let max_gas_amount_config = gas_schedule::max_gas_amount();
         assert!(
             max_gas_amount <= max_gas_amount_config,
             auth_validator::error_validate_max_gas_amount_exceeded(),
         );
 
-        let gas_balance = gas_coin::balance(sender);
+        // Check total gas balance (account store + payment hub)
+        let total_gas_balance = transaction_gas::total_available_gas_balance(sender);
 
         // we do not need to check the gas balance in local or dev chain
         if(!chain_id::is_local_or_dev()){
             assert!(
-                gas_balance >= gas,
+                total_gas_balance >= gas,
                 auth_validator::error_validate_cant_pay_gas_deposit(),
             );
         };
@@ -86,26 +95,48 @@ module rooch_framework::transaction_validator {
         // === validate the authenticator ===
 
         // Try the built-in auth validator first
-        let (bitcoin_address, session_key, auth_validator)= if (auth_validator_id == session_validator::auth_validator_id()){
+        let (bitcoin_address_opt, session_key, vm_fragment, auth_validator) = if (auth_validator_id == session_validator::auth_validator_id()){
             let session_key = session_validator::validate(authenticator_payload);
             let bitcoin_address = address_mapping::resolve_bitcoin(sender);
-            (bitcoin_address, option::some(session_key), option::none())
+            (bitcoin_address, option::some(session_key), option::none(), option::none())
         }else if (auth_validator_id == bitcoin_validator::auth_validator_id()){
             let bitcoin_address = bitcoin_validator::validate(authenticator_payload);
-            (option::some(bitcoin_address), option::none(), option::none())
+            (option::some(bitcoin_address), option::none(), option::none(), option::none())
+        }else if (auth_validator_id == webauthn_validator::auth_validator_id()){
+            let session_key = webauthn_validator::validate(authenticator_payload);
+            let bitcoin_address = address_mapping::resolve_bitcoin(sender);
+            (bitcoin_address, option::some(session_key), option::none(), option::none())
+        }else if (auth_validator_id == did_validator::auth_validator_id()){
+            let (_did, vm_fragment) = did_validator::validate(authenticator_payload);
+            // DID accounts may not have associated Bitcoin addresses
+            let bitcoin_address = address_mapping::resolve_bitcoin(sender);
+            (bitcoin_address, option::none(), option::some(vm_fragment), option::none())
         }else{
             let auth_validator = auth_validator_registry::borrow_validator(auth_validator_id);
             let validator_id = auth_validator::validator_id(auth_validator);
             // The third-party auth validator must be installed to the sender's account
-            assert!(account_authentication::is_auth_validator_installed(sender, validator_id),
+            assert!(builtin_validators::is_builtin_auth_validator(validator_id) || account_authentication::is_auth_validator_installed(sender, validator_id),
                     auth_validator::error_validate_not_installed_auth_validator());
             let bitcoin_address = address_mapping::resolve_bitcoin(sender);
-            (bitcoin_address, option::none(), option::some(*auth_validator))
+            (bitcoin_address, option::none(), option::none(), option::some(*auth_validator))
         };
-        //The bitcoin address must exist
-        assert!(option::is_some(&bitcoin_address), auth_validator::error_validate_account_does_not_exist());
-        let bitcoin_address = option::destroy_some(bitcoin_address);
-        auth_validator::new_tx_validate_result(auth_validator_id, auth_validator, session_key, bitcoin_address)
+        
+        // We enable the smart contract account(DID account) to send transaction via session key, and the smart contract account does not have a bitcoin address.
+        // But for compatibility, we still need to return a empty bitcoin address in the TxValidateResult.
+        let bitcoin_address = if (option::is_some(&bitcoin_address_opt)) {
+            option::destroy_some(bitcoin_address_opt)
+        }else {
+            bitcoin_address::empty()
+        };
+        
+        // Use unified API for all authentication methods
+        auth_validator::new_tx_validate_result_with_optional_data(
+            auth_validator_id, 
+            auth_validator, 
+            session_key, 
+            vm_fragment, 
+            bitcoin_address
+        )
     }
 
     /// Transaction pre_execute function.
@@ -118,15 +149,18 @@ module rooch_framework::transaction_validator {
         //Auto create account if not exist
         if (!account::exists_at(sender)) {
             account_entry::create_account(sender);
-            //if the chain is local or dev, give the sender some RGC
-            if (chain_id::is_local_or_dev()) {
-                //100 RGC
-                let init_gas = 1_00_000_000u256;
-                gas_coin::faucet(sender, init_gas); 
-            };
         };
-        let bitcoin_addr = auth_validator::get_bitcoin_address_from_ctx();
-        address_mapping::bind_bitcoin_address(sender, bitcoin_addr); 
+        //if the chain is local or dev, give the sender some RGAS
+        if (chain_id::is_local_or_dev() && gas_coin::balance(sender) == 0) {
+            //10000 RGAS
+            let init_gas = 1000_000_000_000u256;
+            gas_coin::faucet(sender, init_gas); 
+        };
+        let bitcoin_addr_opt = auth_validator::get_bitcoin_address_from_ctx_option();
+        if (option::is_some(&bitcoin_addr_opt)) {
+            let bitcoin_addr = option::destroy_some(bitcoin_addr_opt);
+            address_mapping::bind_bitcoin_address_internal(sender, bitcoin_addr); 
+        };
         let tx_sequence_info = tx_context::get_attribute<TransactionSequenceInfo>();
         if (option::is_some(&tx_sequence_info)) {
             let tx_sequence_info = option::extract(&mut tx_sequence_info);
@@ -134,6 +168,17 @@ module rooch_framework::transaction_validator {
             let module_signer = module_signer<TransactionValidatorPlaceholder>();
             timestamp::try_update_global_time(&module_signer, tx_timestamp);
         };
+        let gas_payment_account = tx_context::tx_gas_payment_account();
+        let max_gas_amount = tx_context::max_gas_amount();
+        let gas = transaction_fee::calculate_gas(max_gas_amount);
+        
+        // Use enhanced gas deduction with payment hub fallback
+        let (gas_coin, usage_info) = transaction_gas::deduct_transaction_gas(gas_payment_account, gas);
+        
+        // Store usage info for refund in post_execute
+        transaction_gas::store_gas_usage_info(usage_info);
+        
+        transaction_fee::deposit_fee(gas_coin);
     }
 
     /// Transaction post_execute function.
@@ -157,8 +202,35 @@ module rooch_framework::transaction_validator {
         let tx_result = tx_context::tx_result();
         let gas_payment_account = tx_context::tx_gas_payment_account();
         let gas_used = tx_result::gas_used(&tx_result);
-        let gas = transaction_fee::calculate_gas(gas_used);
-        let gas_coin = gas_coin::deduct_gas(gas_payment_account, gas);
-        transaction_fee::deposit_fee(gas_coin);
+        let gas_used_after_scale = transaction_fee::calculate_gas(gas_used);
+
+        let max_gas_amount = tx_context::max_gas_amount();
+        let paid_gas = transaction_fee::calculate_gas(max_gas_amount);
+
+        let tx_meta = tx_context::tx_meta();
+        let function_call_opt = tx_meta::function_meta(&tx_meta);
+        let contract_address = if (option::is_some(&function_call_opt)) {
+            let function_call = option::borrow(&function_call_opt);
+            *tx_meta::function_meta_module_address(function_call)
+        } else {
+            //If it is not a function call, we use the framework address as the contract address
+            @rooch_framework
+        };
+        let sequencer_address = onchain_config::sequencer();
+        let remaining_gas_coin = transaction_fee::distribute_fee(paid_gas, gas_used_after_scale, contract_address, sequencer_address);
+        
+        // Get usage info and use smart refund
+        let usage_info_opt = transaction_gas::get_gas_usage_info();
+        if (option::is_some(&usage_info_opt)) {
+            let usage_info = option::extract(&mut usage_info_opt);
+            transaction_gas::refund_transaction_gas(gas_payment_account, remaining_gas_coin, usage_info);
+        } else {
+            // Fallback: refund to account store
+            if (coin::value(&remaining_gas_coin) > 0) {
+                account_coin_store::deposit(gas_payment_account, remaining_gas_coin);
+            } else {
+                coin::destroy_zero(remaining_gas_coin);
+            }
+        }
     }
 }

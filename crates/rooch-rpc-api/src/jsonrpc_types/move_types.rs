@@ -1,6 +1,7 @@
 // Copyright (c) RoochNetwork
 // SPDX-License-Identifier: Apache-2.0
 
+use super::{decimal_value_view::DecimalValueView, move_option_view::MoveOptionView};
 use crate::jsonrpc_types::{BytesView, StrView};
 use anyhow::Result;
 use move_binary_format::file_format::Ability;
@@ -11,7 +12,6 @@ use move_core_types::{
     u256,
 };
 use move_resource_viewer::{AnnotatedMoveStruct, AnnotatedMoveValue};
-use moveos_types::move_types::parse_module_id;
 use moveos_types::moveos_std::object::ObjectID;
 use moveos_types::moveos_std::type_info::TypeInfo;
 use moveos_types::transaction::MoveAction;
@@ -24,10 +24,17 @@ use moveos_types::{
     move_std::{ascii::MoveAsciiString, string::MoveString},
     state::MoveStructType,
 };
+use moveos_types::{move_types::parse_module_id, moveos_std::decimal_value::DecimalValue};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::str::FromStr;
+
+// This feature flag to control should we handle the Move Option as special struct.
+// This change is not backward compatible, so we need to prepare compatible solution first.
+// After that, we can enable this feature flag to make the output more readable.
+// https://github.com/rooch-network/rooch/issues/3445
+const SPECIFIC_STRUCTS_OPTION_FEATURE_FLAG: bool = false;
 
 pub type ModuleIdView = StrView<ModuleId>;
 pub type TypeTagView = StrView<TypeTag>;
@@ -83,6 +90,7 @@ impl FromStr for ObjectIDVecView {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let ids = s
             .split(',')
+            .filter(|s| !s.is_empty())
             .map(ObjectID::from_str)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(StrView(ids))
@@ -127,7 +135,7 @@ impl From<AbilityView> for Ability {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Serialize, JsonSchema, Eq, PartialEq)]
 pub struct AnnotatedMoveStructView {
     pub abilities: u8,
     #[serde(rename = "type")]
@@ -150,17 +158,95 @@ impl From<AnnotatedMoveStruct> for AnnotatedMoveStructView {
     }
 }
 
+impl From<AnnotatedMoveStructView> for serde_json::Value {
+    fn from(value: AnnotatedMoveStructView) -> Self {
+        let to_json_result = serde_json::to_value(value);
+        debug_assert!(
+            to_json_result.is_ok(),
+            "AnnotatedMoveStructView to json failed"
+        );
+        to_json_result.unwrap_or(serde_json::Value::Null)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema, Eq, PartialEq)]
+pub struct AnnotatedMoveStructVectorView {
+    /// alilities of each element
+    pub abilities: u8,
+    #[serde(rename = "type")]
+    /// type of each element
+    pub type_: StructTagView,
+    /// field of each element
+    pub field: Vec<IdentifierView>,
+    // values of the whole vector
+    pub value: Vec<Vec<AnnotatedMoveValueView>>,
+}
+
+impl AnnotatedMoveStructVectorView {
+    fn try_from(origin: Vec<AnnotatedMoveValue>) -> Result<Self, AnnotatedMoveValueView> {
+        if origin.is_empty() {
+            Err(AnnotatedMoveValueView::Vector(
+                origin.into_iter().map(Into::into).collect(),
+            ))
+        } else {
+            let first = origin.first().unwrap();
+            if let AnnotatedMoveValue::Struct(ele) = first {
+                //For compatibility reasons, we do not enable this feature flag by default
+                if SPECIFIC_STRUCTS_OPTION_FEATURE_FLAG {
+                    //if the first element is a specific struct, we directly convert it to vector,
+                    //otherwise, we convert it to StructVector
+                    if SpecificStructView::try_from_annotated(ele).is_some() {
+                        return Err(AnnotatedMoveValueView::Vector(
+                            origin.into_iter().map(Into::into).collect(),
+                        ));
+                    }
+                }
+                let field = ele
+                    .value
+                    .iter()
+                    .map(|x| IdentifierView::from(x.0.clone()))
+                    .collect();
+                let abilities = ele.abilities.into_u8();
+                let type_ = StrView(ele.type_.clone());
+                let value: Vec<Vec<AnnotatedMoveValueView>> = origin
+                    .into_iter()
+                    .map(|v| {
+                        if let AnnotatedMoveValue::Struct(s) = v {
+                            s.value.into_iter().map(|(_, v)| v.into()).collect()
+                        } else {
+                            unreachable!("AnnotatedMoveStructVectorView")
+                        }
+                    })
+                    .collect();
+
+                Ok(Self {
+                    abilities,
+                    type_,
+                    field,
+                    value,
+                })
+            } else {
+                Err(AnnotatedMoveValueView::Vector(
+                    origin.into_iter().map(Into::into).collect(),
+                ))
+            }
+        }
+    }
+}
+
 /// Some specific struct that we want to display in a special way for better readability
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Serialize, JsonSchema, Eq, PartialEq)]
 #[serde(untagged)]
 pub enum SpecificStructView {
     MoveString(MoveString),
     MoveAsciiString(MoveAsciiString),
     ObjectID(ObjectID),
+    DecimalValue(DecimalValueView),
+    Option(MoveOptionView),
 }
 
 impl SpecificStructView {
-    pub fn try_from_annotated(move_struct: AnnotatedMoveStruct) -> Option<Self> {
+    pub fn try_from_annotated(move_struct: &AnnotatedMoveStruct) -> Option<Self> {
         if MoveString::struct_tag_match(&move_struct.type_) {
             MoveString::try_from(move_struct)
                 .ok()
@@ -173,30 +259,67 @@ impl SpecificStructView {
             ObjectID::try_from(move_struct)
                 .ok()
                 .map(SpecificStructView::ObjectID)
+        } else if DecimalValue::struct_tag_match(&move_struct.type_) {
+            DecimalValue::try_from(move_struct)
+                .ok()
+                .map(DecimalValueView::from)
+                .map(SpecificStructView::DecimalValue)
+        } else if MoveOptionView::struct_tag_match(&move_struct.type_) {
+            if SPECIFIC_STRUCTS_OPTION_FEATURE_FLAG {
+                // if the feature flag is enabled, we will treat MoveOption as a specific struct
+                MoveOptionView::try_from(move_struct)
+                    .ok()
+                    .map(SpecificStructView::Option)
+            } else {
+                None
+            }
         } else {
             None
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Eq, PartialEq, PartialOrd, Ord)]
-// #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// AnnotatedMoveValueView only used for serialization
+#[derive(Debug, Clone, Serialize, JsonSchema, Eq, PartialEq)]
 #[serde(untagged)]
 pub enum AnnotatedMoveValueView {
     U8(u8),
+    U16(u16),
+    U32(u32),
     ///u64, u128, U256 is too large to be serialized in json
     /// so we use string to represent them
     U64(StrView<u64>),
     U128(StrView<u128>),
+    U256(StrView<u256::U256>),
     Bool(bool),
     Address(AccountAddressView),
-    Vector(Vec<AnnotatedMoveValueView>),
     Bytes(BytesView),
+    SpecificStruct(Box<SpecificStructView>),
     Struct(AnnotatedMoveStructView),
-    SpecificStruct(SpecificStructView),
-    U16(u16),
-    U32(u32),
-    U256(StrView<u256::U256>),
+    StructVector(Box<AnnotatedMoveStructVectorView>),
+    Vector(Vec<AnnotatedMoveValueView>),
+    // Add this variant as a "catch-all" for forward compatibility
+    //Unknown(serde_json::Value),
+}
+
+impl AnnotatedMoveValueView {
+    /// Calculate the total number of Move structs recursively
+    pub fn size_of_struct_recursively(origin: &AnnotatedMoveValue) -> usize {
+        match origin {
+            AnnotatedMoveValue::Vector(_, data) => match data.first() {
+                Some(first) => Self::size_of_struct_recursively(first) * data.len(),
+                None => 0,
+            },
+            AnnotatedMoveValue::Struct(data) => {
+                let mut size = 1;
+                for (_, v) in &data.value {
+                    size += Self::size_of_struct_recursively(v);
+                }
+                size
+            }
+            _ => 0,
+        }
+    }
 }
 
 impl From<AnnotatedMoveValue> for AnnotatedMoveValueView {
@@ -208,12 +331,17 @@ impl From<AnnotatedMoveValue> for AnnotatedMoveValueView {
             AnnotatedMoveValue::Bool(b) => AnnotatedMoveValueView::Bool(b),
             AnnotatedMoveValue::Address(data) => AnnotatedMoveValueView::Address(StrView(data)),
             AnnotatedMoveValue::Vector(_type_tag, data) => {
-                AnnotatedMoveValueView::Vector(data.into_iter().map(Into::into).collect())
+                match AnnotatedMoveStructVectorView::try_from(data) {
+                    Ok(v) => AnnotatedMoveValueView::StructVector(Box::new(v)),
+                    Err(v) => v,
+                }
             }
             AnnotatedMoveValue::Bytes(data) => AnnotatedMoveValueView::Bytes(StrView(data)),
             AnnotatedMoveValue::Struct(data) => {
-                match SpecificStructView::try_from_annotated(data.clone()) {
-                    Some(struct_view) => AnnotatedMoveValueView::SpecificStruct(struct_view),
+                match SpecificStructView::try_from_annotated(&data) {
+                    Some(struct_view) => {
+                        AnnotatedMoveValueView::SpecificStruct(Box::new(struct_view))
+                    }
                     None => AnnotatedMoveValueView::Struct(data.into()),
                 }
             }
@@ -224,39 +352,16 @@ impl From<AnnotatedMoveValue> for AnnotatedMoveValueView {
     }
 }
 
-//We can not support convert from AnnotatedMoveValueView to AnnotatedMoveValue
-// It is not easy to implement because:
-// 1. We need to put type_tag in the Vector
-// 2. We need to support convert SpecificStruct to AnnotatedMoveStruct
-// impl TryFrom<AnnotatedMoveValueView> for AnnotatedMoveValue {
-//     type Error = anyhow::Error;
-//     fn try_from(value: AnnotatedMoveValueView) -> Result<Self, Self::Error> {
-//         Ok(match value {
-//             AnnotatedMoveValueView::U8(u8) => AnnotatedMoveValue::U8(u8),
-//             AnnotatedMoveValueView::U64(u64) => AnnotatedMoveValue::U64(u64.0),
-//             AnnotatedMoveValueView::U128(u128) => AnnotatedMoveValue::U128(u128.0),
-//             AnnotatedMoveValueView::Bool(bool) => AnnotatedMoveValue::Bool(bool),
-//             AnnotatedMoveValueView::Address(address) => AnnotatedMoveValue::Address(address.0),
-//             AnnotatedMoveValueView::Vector(type_tag, data) =>
-//                 AnnotatedMoveValue::Vector(
-//                 type_tag.0,
-//                 data.into_iter()
-//                     .map(AnnotatedMoveValue::try_from)
-//                     .collect::<Result<Vec<_>, Self::Error>>()?,
-//             ),
-//             AnnotatedMoveValueView::Bytes(data) => AnnotatedMoveValue::Bytes(data.0),
-//             AnnotatedMoveValueView::Struct(data) => AnnotatedMoveValue::Struct(data.try_into()?),
-//             AnnotatedMoveValueView::SpecificStruct(data) => match data {
-//                 SpecificStructView::MoveString(string) => AnnotatedMoveValue::Struct(string.into()),
-//                 SpecificStructView::MoveAsciiString(string) => AnnotatedMoveValue::Struct(string.into()),
-//                 SpecificStructView::ObjectID(id) => AnnotatedMoveValue::Struct(id.into()),
-//             },
-//             AnnotatedMoveValueView::U16(u16) => AnnotatedMoveValue::U16(u16),
-//             AnnotatedMoveValueView::U32(u32) => AnnotatedMoveValue::U32(u32),
-//             AnnotatedMoveValueView::U256(u256) => AnnotatedMoveValue::U256(u256.0),
-//         })
-//     }
-// }
+impl From<AnnotatedMoveValueView> for serde_json::Value {
+    fn from(value: AnnotatedMoveValueView) -> Self {
+        let to_json_result = serde_json::to_value(value);
+        debug_assert!(
+            to_json_result.is_ok(),
+            "AnnotatedMoveValueView to json failed"
+        );
+        to_json_result.unwrap_or(serde_json::Value::Null)
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct ScriptCallView {

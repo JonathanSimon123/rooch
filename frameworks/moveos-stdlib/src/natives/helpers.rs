@@ -4,12 +4,15 @@
 // Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use move_binary_format::errors::PartialVMResult;
+use move_binary_format::errors::{PartialVMError, PartialVMResult};
+use move_core_types::vm_status::{StatusCode, VMStatus};
 use move_vm_runtime::native_functions::{NativeContext, NativeFunction};
 use move_vm_types::{
     loaded_data::runtime_types::Type, natives::function::NativeResult, values::Value,
 };
 use std::{collections::VecDeque, sync::Arc};
+
+pub const E_NATIVE_FUNCTION_PANIC: u64 = 987654321;
 
 pub fn make_module_natives(
     natives: impl IntoIterator<Item = (impl Into<String>, NativeFunction)>,
@@ -35,7 +38,7 @@ where
             if cfg!(debug_assertions) {
                 match &result {
                     Err(err) => {
-                        log::debug!("Error in native function: {:?}", err);
+                        tracing::debug!("Error in native function: {:?}", err);
                     }
                     Ok(res) => match res {
                         NativeResult::Success {
@@ -43,14 +46,14 @@ where
                             ret_vals: _,
                         } => {}
                         NativeResult::Abort { cost, abort_code } => {
-                            log::debug!(
+                            tracing::debug!(
                                 "Abort in native function: cost: {:?}, abort_code: {:?}",
                                 cost,
                                 abort_code
                             );
                         }
                         NativeResult::OutOfGas { partial_cost } => {
-                            log::debug!(
+                            tracing::debug!(
                                 "OutOfGas in native function: partial_cost: {:?}",
                                 partial_cost
                             );
@@ -58,7 +61,22 @@ where
                     },
                 }
             }
-            result
+            if let Err(err) = &result {
+                let status = err.major_status();
+                let vm_status = VMStatus::error(status, None);
+                let error_message = format!("Native function execution panic {}", err);
+                match vm_status.keep_or_discard() {
+                    Ok(_) => result,
+                    Err(_) => {
+                        tracing::error!("{}", error_message);
+                        Err(PartialVMError::new(StatusCode::ABORTED)
+                            .with_sub_status(E_NATIVE_FUNCTION_PANIC)
+                            .with_message(error_message))
+                    }
+                }
+            } else {
+                result
+            }
         },
     )
 }

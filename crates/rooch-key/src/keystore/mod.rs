@@ -71,6 +71,13 @@ impl AccountKeystore for Keystore {
         }
     }
 
+    fn contains_address(&self, address: &RoochAddress) -> bool {
+        match self {
+            Keystore::File(file_keystore) => file_keystore.contains_address(address),
+            Keystore::InMem(inmem_keystore) => inmem_keystore.contains_address(address),
+        }
+    }
+
     fn get_accounts(
         &self,
         password: Option<String>,
@@ -210,6 +217,22 @@ impl AccountKeystore for Keystore {
             }
             Keystore::InMem(inmem_keystore) => {
                 inmem_keystore.binding_session_key(address, session_key)
+            }
+        }
+    }
+
+    fn get_session_key(
+        &self,
+        address: &RoochAddress,
+        authentication_key: &AuthenticationKey,
+        password: Option<String>,
+    ) -> Result<Option<RoochKeyPair>, anyhow::Error> {
+        match self {
+            Keystore::File(file_keystore) => {
+                file_keystore.get_session_key(address, authentication_key, password)
+            }
+            Keystore::InMem(inmem_keystore) => {
+                inmem_keystore.get_session_key(address, authentication_key, password)
             }
         }
     }

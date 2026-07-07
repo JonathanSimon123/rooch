@@ -19,11 +19,22 @@ export class Transaction {
     } & CallFunctionArgs,
   ) {
     this.info = input.info
-    this.data = new TransactionData(MoveAction.newCallFunction(input))
+    this.data = new TransactionData(
+      MoveAction.newCallFunction(input),
+      input.maxGas ? BigInt(input.maxGas) : undefined,
+    )
   }
 
   getInfo() {
     return this.info
+  }
+
+  getMaxGas() {
+    return this.getData().maxGas
+  }
+
+  setMaxGas(input: number) {
+    this.getData().maxGas = BigInt(input)
   }
 
   setSender(input: address) {
@@ -46,9 +57,13 @@ export class Transaction {
     return this.getData().hash()
   }
 
+  encodeData() {
+    return this.data!.encode()
+  }
+
   encode() {
     return bcs.RoochTransaction.serialize({
-      data: this.data!.encode(),
+      data: this.data!.encode().toBytes(),
       auth: this.auth!.encode(),
     })
   }

@@ -9,18 +9,19 @@ import { createWalletStore, WalletStore } from './walletStore.js'
 import {
   useAutoConnectWallet,
   useCurrentSession,
-  useSession,
-  useWalletStore,
   useCurrentNetwork,
+  useSessions,
 } from '../hooks/index.js'
 import { useSessionStore } from '../hooks/useSessionsStore.js'
 import { getDefaultStorage, StorageType, checkWallets } from '../utils/index.js'
 import { SupportChain, SupportWallet } from '../feature/index.js'
-import { getRegisteredWallets } from '../wellet/util.js'
-import { getWallets } from '../wellet/wallets.js'
+import { getRegisteredWallets } from '../wallet/util.js'
+import { getWallets } from '../wallet/wallets.js'
 import { useWalletChanged } from '../hooks/index.js'
+import { useWalletStore } from '../hooks/wallet/useWalletStore.js'
 
 type WalletProviderProps = {
+  enableLocal?: boolean
   preferredWallets?: SupportWallet[]
 
   chain?: SupportChain
@@ -42,7 +43,8 @@ const DEFAULT_STORAGE_KEY = 'rooch-sdk-kit:wallet-connect-info'
 export const WalletContext = createContext<WalletStore | null>(null)
 
 export function WalletProvider({
-  preferredWallets = ['unisat', 'okx'],
+  enableLocal = false,
+  preferredWallets = ['UniSat', 'OKX'],
   chain = 'bitcoin',
   storage,
   storageKey = DEFAULT_STORAGE_KEY,
@@ -64,12 +66,16 @@ export function WalletProvider({
 
   useEffect(() => {
     const fetchWallet = async () => {
-      const wallets = await checkWallets(chain)
+      let wallets = await checkWallets(chain)
+      if (!enableLocal) {
+        wallets = wallets.filter((item) => item.getName() !== 'Local')
+      }
+
       getWallets().register(...wallets)
     }
 
     fetchWallet()
-  }, [chain])
+  }, [chain, enableLocal])
 
   return (
     <WalletContext.Provider value={storeRef.current}>
@@ -94,7 +100,7 @@ function WalletConnectionManager({ children, preferredWallets }: WalletConnectio
   const setConnectionStatus = useWalletStore((state) => state.setConnectionStatus)
   const setAddressSwitched = useWalletStore((store) => store.setAddressSwitched)
   const currentAddress = useWalletStore((state) => state.currentAddress)
-  const sessions = useSession()
+  const sessions = useSessions()
   const curSession = useCurrentSession()
   const setCurrentSession = useSessionStore((state) => state.setCurrentSession)
 

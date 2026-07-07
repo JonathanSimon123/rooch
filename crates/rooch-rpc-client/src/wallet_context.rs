@@ -4,7 +4,12 @@
 use crate::client_config::{ClientConfig, DEFAULT_EXPIRATION_SECS};
 use crate::Client;
 use anyhow::{anyhow, Result};
+use bitcoin::key::Secp256k1;
+use bitcoin::psbt::{GetKey, KeyRequest};
+use bitcoin::secp256k1::Signing;
+use bitcoin::PrivateKey;
 use move_core_types::account_address::AccountAddress;
+use moveos_types::module_binding::MoveFunctionCaller;
 use moveos_types::moveos_std::gas_schedule::GasScheduleConfig;
 use moveos_types::transaction::MoveAction;
 use rooch_config::config::{Config, PersistedConfig};
@@ -13,17 +18,26 @@ use rooch_key::keystore::account_keystore::AccountKeystore;
 use rooch_key::keystore::file_keystore::FileBasedKeystore;
 use rooch_key::keystore::Keystore;
 use rooch_rpc_api::jsonrpc_types::{ExecuteTransactionResponseView, KeptVMStatusView, TxOptions};
-use rooch_types::address::ParsedAddress;
 use rooch_types::address::RoochAddress;
-use rooch_types::addresses;
+use rooch_types::address::{BitcoinAddress, ParsedAddress};
+use rooch_types::authentication_key::AuthenticationKey;
+use rooch_types::bitcoin::network::Network;
+use rooch_types::crypto::RoochKeyPair;
 use rooch_types::error::{RoochError, RoochResult};
+use rooch_types::framework::did::DIDModule;
+use rooch_types::rooch_network::{BuiltinChainID, RoochNetwork};
+use rooch_types::transaction::authenticator::{DIDAuthenticator, SigningEnvelope};
 use rooch_types::transaction::rooch::{RoochTransaction, RoochTransactionData};
+use rooch_types::{addresses, crypto};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tracing::{debug, info};
 
+#[derive(Debug)]
 pub struct WalletContext {
     client: Arc<RwLock<Option<Client>>>,
     pub client_config: PersistedConfig<ClientConfig>,
@@ -45,7 +59,7 @@ impl WalletContext {
             )
         })?;
 
-        let client_config = client_config.persisted(&client_config_path);
+        let mut client_config = client_config.persisted(&client_config_path);
 
         let keystore_result = FileBasedKeystore::load(&client_config.keystore_path);
         let keystore = match keystore_result {
@@ -57,7 +71,21 @@ impl WalletContext {
         address_mapping.extend(addresses::rooch_framework_named_addresses());
 
         //TODO support account name alias name.
-        if let Some(active_address) = client_config.active_address {
+        if let Some(active_address) = &client_config.active_address {
+            let active_address = if !keystore.contains_address(active_address) {
+                //The active address is not in the keystore, maybe the user reset the keystore.
+                //We auto change the active address to the first address in the keystore.
+                let first_address = keystore
+                    .addresses()
+                    .pop()
+                    .ok_or_else(|| anyhow!("No address in the keystore"))?;
+                info!("The active address {} is not in the keystore, auto change the active address to the first address in the keystore: {}", active_address, first_address);
+                client_config.active_address = Some(first_address);
+                client_config.save()?;
+                first_address
+            } else {
+                *active_address
+            };
             address_mapping.insert("default".to_string(), active_address.into());
         }
 
@@ -80,17 +108,56 @@ impl WalletContext {
     }
 
     pub fn resolve_address(&self, parsed_address: ParsedAddress) -> RoochResult<AccountAddress> {
+        self.resolve_rooch_address(parsed_address)
+            .map(|address| address.into())
+    }
+
+    pub fn resolve_rooch_address(
+        &self,
+        parsed_address: ParsedAddress,
+    ) -> RoochResult<RoochAddress> {
         match parsed_address {
-            ParsedAddress::Numerical(address) => Ok(address.into()),
-            ParsedAddress::Named(name) => {
-                self.address_mapping.get(&name).cloned().ok_or_else(|| {
+            ParsedAddress::Numerical(address) => Ok(address),
+            ParsedAddress::Named(name) => self
+                .address_mapping
+                .get(&name)
+                .cloned()
+                .map(|address| address.into())
+                .ok_or_else(|| {
                     RoochError::CommandArgumentError(format!("Unknown named address: {}", name))
-                })
+                }),
+            ParsedAddress::Bitcoin(address) => Ok(address.to_rooch_address()),
+            ParsedAddress::DID(address) => Ok(address),
+        }
+    }
+
+    pub async fn resolve_bitcoin_address(
+        &self,
+        parsed_address: ParsedAddress,
+    ) -> RoochResult<BitcoinAddress> {
+        match parsed_address {
+            ParsedAddress::Bitcoin(address) => Ok(address),
+            _ => {
+                let address = self.resolve_rooch_address(parsed_address)?;
+                let account = self.keystore.get_account(&address, self.password.clone())?;
+                if let Some(account) = account {
+                    let bitcoin_address = account.bitcoin_address;
+                    Ok(bitcoin_address)
+                } else {
+                    let client = self.get_client().await?;
+                    let bitcoin_address = client.rooch.resolve_bitcoin_address(address).await?;
+                    bitcoin_address.ok_or_else(|| {
+                        RoochError::CommandArgumentError(format!(
+                            "Cannot resolve bitcoin address from {}",
+                            address
+                        ))
+                    })
+                }
             }
         }
     }
 
-    /// Parse and resolve addresses from a map of name to address string    
+    /// Parse and resolve addresses from a map of name to address string
     pub fn parse_and_resolve_addresses(
         &self,
         addresses: BTreeMap<String, String>,
@@ -131,34 +198,75 @@ impl WalletContext {
         action: MoveAction,
         max_gas_amount: Option<u64>,
     ) -> RoochResult<RoochTransactionData> {
+        self.build_tx_data_with_sequence_number(sender, action, max_gas_amount, None)
+            .await
+    }
+
+    pub async fn build_tx_data_with_sequence_number(
+        &self,
+        sender: RoochAddress,
+        action: MoveAction,
+        max_gas_amount: Option<u64>,
+        sequence_number: Option<u64>,
+    ) -> RoochResult<RoochTransactionData> {
         let client = self.get_client().await?;
         let chain_id = client.rooch.get_chain_id().await?;
-        let sequence_number = client
-            .rooch
-            .get_sequence_number(sender)
-            .await
-            .map_err(RoochError::from)?;
-        log::debug!("use sequence_number: {}", sequence_number);
+        let sequence_number = sequence_number.unwrap_or(
+            client
+                .rooch
+                .get_sequence_number(sender)
+                .await
+                .map_err(RoochError::from)?,
+        );
+        tracing::debug!("use sequence_number: {}", sequence_number);
         //TODO max gas amount from cli option or dry run estimate
         let tx_data = RoochTransactionData::new(
             sender,
             sequence_number,
             chain_id,
-            max_gas_amount.unwrap_or(GasScheduleConfig::INITIAL_MAX_GAS_AMOUNT),
+            max_gas_amount.unwrap_or(GasScheduleConfig::CLI_DEFAULT_MAX_GAS_AMOUNT),
             action,
         );
         Ok(tx_data)
     }
 
-    pub async fn sign(
+    pub fn generate_session_key(&mut self, address: &RoochAddress) -> Result<AuthenticationKey> {
+        self.keystore
+            .generate_session_key(address, self.password.clone())
+    }
+
+    pub fn get_session_key(
         &self,
-        sender: RoochAddress,
-        action: MoveAction,
-        password: Option<String>,
-        max_gas_amount: Option<u64>,
+        address: &RoochAddress,
+        authentication_key: &AuthenticationKey,
+    ) -> Result<Option<RoochKeyPair>> {
+        self.keystore
+            .get_session_key(address, authentication_key, self.password.clone())
+    }
+
+    pub fn sign_transaction_via_session_key(
+        &self,
+        signer: &RoochAddress,
+        tx_data: RoochTransactionData,
+        authentication_key: &AuthenticationKey,
     ) -> RoochResult<RoochTransaction> {
-        let tx_data = self.build_tx_data(sender, action, max_gas_amount).await?;
-        let tx = self.keystore.sign_transaction(&sender, tx_data, password)?;
+        let tx = self.keystore.sign_transaction_via_session_key(
+            signer,
+            tx_data,
+            authentication_key,
+            self.password.clone(),
+        )?;
+        Ok(tx)
+    }
+
+    pub fn sign_transaction(
+        &self,
+        signer: RoochAddress,
+        tx_data: RoochTransactionData,
+    ) -> RoochResult<RoochTransaction> {
+        let tx = self
+            .keystore
+            .sign_transaction(&signer, tx_data, self.password.clone())?;
         Ok(tx)
     }
 
@@ -169,7 +277,13 @@ impl WalletContext {
         let client = self.get_client().await?;
         client
             .rooch
-            .execute_tx(tx, Some(TxOptions { with_output: true }))
+            .execute_tx(
+                tx,
+                Some(TxOptions {
+                    with_output: true,
+                    decode: true,
+                }),
+            )
             .await
             .map_err(|e| RoochError::TransactionError(e.to_string()))
     }
@@ -177,12 +291,162 @@ impl WalletContext {
     pub async fn sign_and_execute(
         &self,
         sender: RoochAddress,
+        tx_data: RoochTransactionData,
+    ) -> RoochResult<ExecuteTransactionResponseView> {
+        let tx = self.sign_transaction(sender, tx_data)?;
+        self.execute(tx).await
+    }
+
+    pub async fn sign_and_execute_action(
+        &self,
+        sender: RoochAddress,
         action: MoveAction,
-        password: Option<String>,
         max_gas_amount: Option<u64>,
     ) -> RoochResult<ExecuteTransactionResponseView> {
-        let tx = self.sign(sender, action, password, max_gas_amount).await?;
-        self.execute(tx).await
+        // Check if the sender address has an associated DID document
+        if self.is_did_address(sender).await? {
+            // Use DID signing method
+            self.sign_and_execute_as_did(sender, action, max_gas_amount)
+                .await
+        } else {
+            // Use traditional wallet signing method
+            let tx_data = self.build_tx_data(sender, action, max_gas_amount).await?;
+            self.sign_and_execute(sender, tx_data).await
+        }
+    }
+
+    /// Sign and execute a transaction **on behalf of a DID account**.
+    /// 1) sender must be the DID's associated account address
+    /// 2) Automatically selects a verification method key available in the local keystore
+    pub async fn sign_and_execute_as_did(
+        &self,
+        did_address: RoochAddress,
+        action: MoveAction,
+        max_gas_amount: Option<u64>,
+    ) -> RoochResult<ExecuteTransactionResponseView> {
+        self.sign_and_execute_as_did_with_options(
+            did_address,
+            action,
+            max_gas_amount,
+            None,
+            SigningEnvelope::RawTxHash,
+        )
+        .await
+    }
+
+    /// Sign and execute a transaction **on behalf of a DID account** with custom options.
+    /// 1) sender must be the DID's associated account address
+    /// 2) Allows specifying verification method fragment and signing envelope
+    pub async fn sign_and_execute_as_did_with_options(
+        &self,
+        did_address: RoochAddress,
+        action: MoveAction,
+        max_gas_amount: Option<u64>,
+        vm_id_fragment: Option<&str>,
+        envelope: SigningEnvelope,
+    ) -> RoochResult<ExecuteTransactionResponseView> {
+        // Find a verification method key available in local keystore
+        let (vm_fragment, _controller_addr, keypair) = self
+            .find_did_verification_method_keypair(did_address, vm_id_fragment)
+            .await?;
+
+        // Build tx_data
+        let tx_data = self
+            .build_tx_data(did_address, action, max_gas_amount)
+            .await?;
+
+        // Sign with DID authenticator using specified envelope
+        let authenticator = DIDAuthenticator::sign(&keypair, &tx_data, &vm_fragment, envelope)?;
+        let tx = RoochTransaction::new(tx_data, authenticator.into());
+
+        // Execute
+        let result = self.execute(tx).await?;
+        self.assert_execute_success(result)
+    }
+
+    /// Find a controller keypair for the given DID address.
+    /// Returns the first controller address and its corresponding keypair found in the local keystore.
+    pub async fn find_did_controller_keypair(
+        &self,
+        did_address: RoochAddress,
+    ) -> RoochResult<(RoochAddress, RoochKeyPair)> {
+        // Query DID document
+        let client = self.get_client().await?;
+        let did_module = client.as_module_binding::<DIDModule>();
+        let did_doc = did_module.get_did_document_by_address(did_address.into())?;
+
+        // Find first controller key available in local keystore
+        for controller in &did_doc.controller {
+            let addr = RoochAddress::from_str(controller.identifier.as_str())?;
+            if self.keystore.contains_address(&addr) {
+                let kp = self.get_key_pair(&addr)?;
+                return Ok((addr, kp));
+            }
+        }
+
+        Err(RoochError::CommandArgumentError(format!(
+            "No controller key of DID {} found in local keystore",
+            did_address
+        )))
+    }
+
+    /// Find a specific verification method keypair for the given DID address.
+    /// If vm_id_fragment is provided, find the keypair for that specific verification method.
+    /// If vm_id_fragment is None, find the first available verification method keypair.
+    pub async fn find_did_verification_method_keypair(
+        &self,
+        did_address: RoochAddress,
+        vm_id_fragment: Option<&str>,
+    ) -> RoochResult<(String, RoochAddress, RoochKeyPair)> {
+        // Query DID document
+        let client = self.get_client().await?;
+        let did_module = client.as_module_binding::<DIDModule>();
+        let did_doc = did_module.get_did_document_by_address(did_address.into())?;
+
+        if let Some(specified_fragment) = vm_id_fragment {
+            // User specified a verification method fragment
+            for element in &did_doc.verification_methods.data {
+                if element.key.as_str() == specified_fragment {
+                    let vm = &element.value;
+                    // Check if we have the corresponding controller key in our keystore
+                    let controller_addr =
+                        RoochAddress::from_str(vm.controller.identifier.as_str())?;
+                    if self.keystore.contains_address(&controller_addr) {
+                        let kp = self.get_key_pair(&controller_addr)?;
+                        return Ok((specified_fragment.to_string(), controller_addr, kp));
+                    }
+                }
+            }
+
+            Err(RoochError::CommandArgumentError(format!(
+                "Verification method '{}' not found or corresponding key not available in keystore",
+                specified_fragment
+            )))
+        } else {
+            // Auto-find the first available verification method
+            for controller in &did_doc.controller {
+                let addr = RoochAddress::from_str(controller.identifier.as_str())?;
+                if self.keystore.contains_address(&addr) {
+                    // Find a verification method that belongs to this controller
+                    for element in &did_doc.verification_methods.data {
+                        let vm = &element.value;
+                        if vm.controller.identifier.as_str() == controller.identifier.as_str() {
+                            let kp = self.get_key_pair(&addr)?;
+                            return Ok((element.key.as_str().to_string(), addr, kp));
+                        }
+                    }
+                }
+            }
+
+            Err(RoochError::CommandArgumentError(format!(
+                "No verification method available for signing. No controller key found in local keystore for DID {}",
+                did_address
+            )))
+        }
+    }
+
+    pub fn get_key_pair(&self, address: &RoochAddress) -> Result<RoochKeyPair> {
+        self.keystore.get_key_pair(address, self.password.clone())
     }
 
     pub fn assert_execute_success(
@@ -205,5 +469,72 @@ impl WalletContext {
 
     pub fn get_password(&self) -> Option<String> {
         self.password.clone()
+    }
+
+    pub async fn get_rooch_network(&self) -> Result<RoochNetwork> {
+        let client = self.get_client().await?;
+        let chain_id = client.rooch.get_chain_id().await?;
+        //TODO support custom chain id
+        let builtin_chain_id = BuiltinChainID::try_from(chain_id)?;
+        Ok(builtin_chain_id.into())
+    }
+
+    pub async fn get_bitcoin_network(&self) -> Result<Network> {
+        let rooch_network = self.get_rooch_network().await?;
+        let bitcoin_network = rooch_types::bitcoin::network::Network::from(
+            rooch_network.genesis_config.bitcoin_network,
+        );
+        Ok(bitcoin_network)
+    }
+
+    /// Check if the given address has an associated DID document
+    /// Returns true if a DID document exists for this address, false otherwise
+    async fn is_did_address(&self, address: RoochAddress) -> RoochResult<bool> {
+        let client = self.get_client().await?;
+        let did_module = client.as_module_binding::<DIDModule>();
+
+        // Check if DID document exists for this address
+        match did_module.exists_did_for_address(address.into()) {
+            Ok(exists) => Ok(exists),
+            Err(_) => {
+                // If there's an error checking DID existence, assume it's not a DID address
+                // This ensures backward compatibility and graceful fallback
+                tracing::debug!(
+                    "Failed to check DID existence for address {}, assuming wallet address",
+                    address
+                );
+                Ok(false)
+            }
+        }
+    }
+}
+
+impl GetKey for WalletContext {
+    type Error = anyhow::Error;
+
+    fn get_key<C: Signing>(
+        &self,
+        key_request: KeyRequest,
+        _secp: &Secp256k1<C>,
+    ) -> Result<Option<PrivateKey>, Self::Error> {
+        debug!("Get key for key_request: {:?}", key_request);
+        let address = match key_request {
+            KeyRequest::Pubkey(pubkey) => {
+                let rooch_public_key = crypto::PublicKey::from_bitcoin_pubkey(&pubkey)?;
+                rooch_public_key.rooch_address()?
+            }
+            KeyRequest::Bip32(_key_source) => {
+                anyhow::bail!("BIP32 key source is not supported");
+            }
+            _ => anyhow::bail!("Unsupported key request: {:?}", key_request),
+        };
+        debug!("Get key for address: {:?}", address);
+        let kp = self
+            .keystore
+            .get_key_pair(&address, self.password.clone())?;
+        Ok(Some(PrivateKey::from_slice(
+            kp.private(),
+            bitcoin::Network::Bitcoin,
+        )?))
     }
 }

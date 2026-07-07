@@ -225,7 +225,7 @@ https://dev-seed.rooch.network
         "type": "0x2::object::ObjectEntity<0x2::timestamp::Timestamp>",
         "value": {
           "flag": 4,
-          "id": "0x4e8d2c243339c6e02f8b7dd34436a1b1eb541b0fe4d938f845f4dbb9d9f218a2",
+          "id": "0x3a7dfe7a9a5cd608810b5ebd60c7adf7316667b17ad5ae703af301b74310bcca",
           "owner": "0x0000000000000000000000000000000000000000000000000000000000000000",
           "value": {
             "abilities": 8,
@@ -274,7 +274,7 @@ https://dev-seed.rooch.network
 
 Rooch 为 object 提供了管理动态字段的能力。动态字段是指将 Resource 或者 Object 以 key, value 的形式储存在 Object 中。特别是，key 可以是异质的，即不受 key 类型的限制。更具体的说，Object 可以被当作 [Table](https://github.com/rooch-network/rooch/blob/main/frameworks/moveos-stdlib/sources/table.move) 或 [Bag](https://github.com/rooch-network/rooch/blob/main/frameworks/moveos-stdlib/sources/bag.move) 来使用。
 
-Rooch object 的提供了两种类型的动态字段：常规类型和Object类型。
+Rooch object 提供了两种类型的动态字段：常规类型和Object类型。
 
 常规类型的动态字段是指任何具有 `store` ability 的类型存放在 object 下；Object 类型的动态字段是将子 Object 对象存放在 object 下。
 

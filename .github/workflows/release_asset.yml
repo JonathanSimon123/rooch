@@ -11,51 +11,31 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          - ubuntu-latest
-          - ubuntu-22.04
-          - macos-latest
-          - windows-2022
         include:
+          - platform: ubuntu-latest
+            runner_json: '["self-hosted","larger-runner","ephemeral-vm"]'
+          - platform: ubuntu-22.04
+            runner_json: '["self-hosted","larger-runner","ephemeral-vm"]'
           - platform: macos-latest
-            architecture: intel
-          - platform: macos-latest
-            architecture: arm64
-    runs-on: ${{matrix.platform}}
+            runner_json: '"macos-latest"'
+    runs-on: ${{ fromJSON(matrix.runner_json) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
-      - name: Install LLVM and Clang # required for bindgen to work, see https://github.com/rust-lang/rust-bindgen/issues/1797
-        uses: KyleMayes/install-llvm-action@v1
-        if: matrix.platform == 'windows-latest'
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
-          version: "11.0"
-          directory: ${{ runner.temp }}/llvm
-      - name: Set LIBCLANG_PATH
-        run: echo "LIBCLANG_PATH=$((gcm clang).source -replace "clang.exe")" >> $env:GITHUB_ENV
-        if: matrix.platform == 'windows-latest'
-      - name: Install LLVM and Clang
-        uses: egor-tensin/setup-clang@v1
-        if: matrix.platform != 'windows-latest' && matrix.platform != 'macos-latest'
-        with:
-          platform: x64
-
-      #fix https://github.com/rooch-network/rooch/issues/1157  with https://github.com/diesel-rs/diesel/blob/master/.github/workflows/ci.yml
-      - name: Install sqlite (Windows)
-        if: matrix.platform == 'windows-2022'
-        shell: cmd
-        run: |
-          choco install sqlite
-          cd /D C:\ProgramData\chocolatey\lib\SQLite\tools
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          lib /machine:x64 /def:sqlite3.def /out:sqlite3.lib
-
-      - name: Set variables for sqlite (Windows)
-        if: matrix.platform == 'windows-2022'
+          toolchain: 1.91.1
+      - name: Install LLVM and Clang (self-hosted Ubuntu)
+        if: contains(matrix.runner_json, 'self-hosted')
         shell: bash
         run: |
-          echo "C:\ProgramData\chocolatey\lib\SQLite\tools" >> $GITHUB_PATH
-          echo "SQLITE3_LIB_DIR=C:\ProgramData\chocolatey\lib\SQLite\tools" >> $GITHUB_ENV
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            clang \
+            llvm \
+            libclang-dev \
+            g++
 
       - name: Install Protoc
         uses: arduino/setup-protoc@v3
@@ -72,8 +52,9 @@ jobs:
         run: bash ./scripts/release.sh ${{ matrix.platform }}
 
       - name: upload artifact asset
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         if: ${{ github.event_name != 'release'}}
+        continue-on-error: true
         with:
           name: rooch-${{ matrix.platform }}.zip
           path: ./rooch-${{ matrix.platform }}.zip

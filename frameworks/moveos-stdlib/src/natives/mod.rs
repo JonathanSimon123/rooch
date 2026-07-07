@@ -4,9 +4,43 @@
 use move_core_types::gas_algebra::InternalGas;
 use move_vm_runtime::native_functions::{make_table_from_iter, NativeFunctionTable};
 use moveos_types::addresses::{MOVEOS_STD_ADDRESS, MOVE_STD_ADDRESS};
+use once_cell::sync::Lazy;
+use std::collections::{BTreeMap, Bound};
+use std::sync::Arc;
 
 pub mod helpers;
 pub mod moveos_stdlib;
+
+pub static OBJECT_ADD_FIELD_GAS_TIERS: Lazy<Arc<BTreeMap<u64, u64>>> = Lazy::new(|| {
+    Arc::new(
+        vec![
+            (0, 1),
+            (200, 2),
+            (400, 4),
+            (800, 16),
+            (1600, 32),
+            (3000, 64),
+        ]
+        .into_iter()
+        .collect(),
+    )
+});
+
+pub fn get_current_and_future_tier(
+    tiers: &BTreeMap<u64, u64>,
+    current: u64,
+    default: u64,
+) -> (u64, Option<u64>) {
+    let current_cost = tiers
+        .get(&current)
+        .or_else(|| tiers.range(..current).next_back().map(|(_, v)| v))
+        .unwrap_or(&default);
+    let next_tier_start = tiers
+        .range::<u64, _>((Bound::Excluded(current), Bound::Unbounded))
+        .next()
+        .map(|(next_tier_start, _)| *next_tier_start);
+    (*current_cost, next_tier_start)
+}
 
 #[derive(Debug, Clone)]
 pub struct GasParameters {
@@ -23,14 +57,16 @@ pub struct GasParameters {
     pub object: moveos_stdlib::object::GasParameters,
     pub json: moveos_stdlib::json::GasParameters,
     pub cbor: moveos_stdlib::cbor::GasParameters,
-    pub wasm: moveos_stdlib::wasm::GasParameters,
     pub tx_context: moveos_stdlib::tx_context::GasParameters,
     pub base58: moveos_stdlib::base58::GasParameters,
+    pub base64: moveos_stdlib::base64::GasParameters,
     pub bech32: moveos_stdlib::bech32::GasParameters,
     pub hash: moveos_stdlib::hash::GasParameters,
     pub bls12381: moveos_stdlib::bls12381::GasParameters,
     pub evm: moveos_stdlib::evm::GasParameters,
     pub groth16: moveos_stdlib::groth16::GasParameters,
+    pub object_list_field_keys: moveos_stdlib::object::ListFieldsGasParameters,
+    pub ability: moveos_stdlib::ability::GasParameters,
 }
 
 impl GasParameters {
@@ -49,14 +85,16 @@ impl GasParameters {
             object: moveos_stdlib::object::GasParameters::zeros(),
             json: moveos_stdlib::json::GasParameters::zeros(),
             cbor: moveos_stdlib::cbor::GasParameters::zeros(),
-            wasm: moveos_stdlib::wasm::GasParameters::zeros(),
             tx_context: moveos_stdlib::tx_context::GasParameters::zeros(),
             base58: moveos_stdlib::base58::GasParameters::zeros(),
+            base64: moveos_stdlib::base64::GasParameters::zeros(),
             bech32: moveos_stdlib::bech32::GasParameters::zeros(),
             hash: moveos_stdlib::hash::GasParameters::zeros(),
             bls12381: moveos_stdlib::bls12381::GasParameters::zeros(),
             evm: moveos_stdlib::evm::GasParameters::zeros(),
             groth16: moveos_stdlib::groth16::GasParameters::zeros(),
+            object_list_field_keys: moveos_stdlib::object::ListFieldsGasParameters::zeros(),
+            ability: moveos_stdlib::ability::GasParameters::zeros(),
         }
     }
 }
@@ -118,12 +156,12 @@ pub fn all_natives(gas_params: GasParameters) -> NativeFunctionTable {
     add_natives!("object", moveos_stdlib::object::make_all(gas_params.object));
     add_natives!("json", moveos_stdlib::json::make_all(gas_params.json));
     add_natives!("cbor", moveos_stdlib::cbor::make_all(gas_params.cbor));
-    add_natives!("wasm", moveos_stdlib::wasm::make_all(gas_params.wasm));
     add_natives!(
         "tx_context",
         moveos_stdlib::tx_context::make_all(gas_params.tx_context)
     );
     add_natives!("base58", moveos_stdlib::base58::make_all(gas_params.base58));
+    add_natives!("base64", moveos_stdlib::base64::make_all(gas_params.base64));
     add_natives!("bech32", moveos_stdlib::bech32::make_all(gas_params.bech32));
     add_natives!("hash", moveos_stdlib::hash::make_all(gas_params.hash));
     add_natives!(
@@ -134,6 +172,10 @@ pub fn all_natives(gas_params: GasParameters) -> NativeFunctionTable {
     add_natives!(
         "groth16",
         moveos_stdlib::groth16::make_all(gas_params.groth16)
+    );
+    add_natives!(
+        "ability",
+        moveos_stdlib::ability::make_all(gas_params.ability)
     );
 
     let moveos_native_fun_table = make_table_from_iter(MOVEOS_STD_ADDRESS, natives);

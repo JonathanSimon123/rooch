@@ -24,7 +24,7 @@ module display::display{
         
         // - `{var_name}`, no space between `{` with `var_name` and `var_name` with `}`.
         // - There are two types of template: 
-        //     - for object meta fields. Availabel fields: {metadata.id}, {metadata.owner}, {metadata.flag}, {metadata.state_root}, {metadata.size}
+        //     - for object meta fields. Available fields: {metadata.id}, {metadata.owner}, {metadata.flag}, {metadata.state_root}, {metadata.size}
         //     - for object instance fields, which depend on your object defination. 
         //       In this example, there are 3 fields: `name`, `creator` and `description` in a `ObjectType` object,
         //       so you can use templates: {name}, {creator}, {description} respectively.
@@ -50,7 +50,6 @@ module display::display{
         };
 
         let obj = object::new(
-            
             obj_type
         );
         let id = object::id(&obj);
@@ -59,5 +58,4 @@ module display::display{
         object::transfer(obj, sender);
         moveos_std::event::emit(NewObjectEvent{id:id});
     }
-
 }

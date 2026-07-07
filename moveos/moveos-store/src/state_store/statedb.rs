@@ -1,8 +1,11 @@
 // Copyright (c) RoochNetwork
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::state_store::metrics::StateDBMetrics;
 use crate::state_store::NodeDBStore;
-use anyhow::{Error, Result};
+use anyhow::{Error, Ok, Result};
+use function_name::named;
+use move_core_types::account_address::AccountAddress;
 use move_core_types::effects::Op;
 use moveos_types::h256::H256;
 use moveos_types::moveos_std::object::GENESIS_STATE_ROOT;
@@ -14,9 +17,12 @@ use moveos_types::state_resolver::RootObjectResolver;
 use moveos_types::state_resolver::StateKV;
 use moveos_types::state_resolver::StateResolver;
 use moveos_types::state_resolver::StatelessResolver;
+use prometheus::Registry;
+use quick_cache::sync::Cache;
 use smt::{SMTIterator, TreeChangeSet};
 use smt::{SMTree, UpdateSet};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub const STATEDB_DUMP_BATCH_SIZE: usize = 5000;
 
@@ -24,24 +30,35 @@ pub const STATEDB_DUMP_BATCH_SIZE: usize = 5000;
 #[derive(Clone)]
 pub struct StateDBStore {
     pub node_store: NodeDBStore,
-    smt: SMTree<FieldKey, ObjectState, NodeDBStore>,
+    pub smt: SMTree<FieldKey, ObjectState, NodeDBStore>,
+    metrics: Arc<StateDBMetrics>,
+    cache: Arc<Cache<(H256, FieldKey), Option<ObjectState>>>,
 }
 
 impl StateDBStore {
-    pub fn new(node_store: NodeDBStore) -> Self {
+    pub fn new(node_store: NodeDBStore, registry: &Registry, cache_size: usize) -> Self {
         Self {
             node_store: node_store.clone(),
-            smt: SMTree::new(node_store),
+            smt: SMTree::new(node_store, registry),
+            metrics: Arc::new(StateDBMetrics::new(registry)),
+            cache: Arc::new(Cache::new(cache_size)),
         }
     }
 
+    #[named]
     pub fn update_fields<I>(&self, pre_state_root: H256, update_set: I) -> Result<TreeChangeSet>
     where
         I: Into<UpdateSet<FieldKey, ObjectState>>,
     {
+        let fn_name = function_name!();
+        let _timer = self
+            .metrics
+            .state_update_fields_latency_seconds
+            .with_label_values(&[fn_name])
+            .start_timer();
         let change_set = self.smt.puts(pre_state_root, update_set)?;
-        if log::log_enabled!(log::Level::Trace) {
-            log::trace!(
+        if tracing::enabled!(tracing::Level::TRACE) {
+            tracing::trace!(
                 "update_fields pre_state_root: {}, new_state_root: {}",
                 pre_state_root,
                 change_set.state_root,
@@ -50,8 +67,20 @@ impl StateDBStore {
         Ok(change_set)
     }
 
+    #[named]
     pub fn update_nodes(&self, nodes: BTreeMap<H256, Vec<u8>>) -> Result<()> {
+        let fn_name = function_name!();
+        let _timer = self
+            .metrics
+            .state_update_nodes_latency_seconds
+            .with_label_values(&[fn_name])
+            .start_timer();
+        let size = nodes.values().map(|v| 32 + v.len()).sum::<usize>();
         self.node_store.write_nodes(nodes)?;
+        self.metrics
+            .state_update_nodes_bytes
+            .with_label_values(&[fn_name])
+            .observe(size as f64);
         Ok(())
     }
 
@@ -71,6 +100,8 @@ impl StateDBStore {
                 Op::Delete => {
                     //TODO clean up the removed object fields
                     update_set.remove(field_key);
+                    let pre_state_root = obj_change.metadata.state_root();
+                    self.cache.remove(&(pre_state_root, field_key));
                     return Ok(());
                 }
             },
@@ -100,11 +131,25 @@ impl StateDBStore {
         let new_state_root = tree_change_set.state_root;
         obj.update_state_root(new_state_root);
         obj_change.update_state_root(new_state_root);
-        update_set.put(field_key, obj);
+        update_set.put(field_key, obj.clone());
+        self.cache.insert((new_state_root, field_key), Some(obj));
+
         Ok(())
     }
 
-    pub fn apply_change_set(&self, state_change_set: &mut StateChangeSet) -> Result<()> {
+    #[named]
+    #[allow(clippy::type_complexity)]
+    pub fn change_set_to_nodes(
+        &self,
+        state_change_set: &mut StateChangeSet,
+    ) -> Result<(BTreeMap<H256, Vec<u8>>, Vec<(H256, H256)>)> {
+        let fn_name = function_name!();
+        let _timer = self
+            .metrics
+            .state_change_set_to_nodes_latency_seconds
+            .with_label_values(&[fn_name])
+            .start_timer();
+
         let root = state_change_set.root_metadata();
         let pre_state_root = root.state_root();
         let global_size = root.size;
@@ -113,6 +158,7 @@ impl StateDBStore {
 
         let mut update_set = UpdateSet::new();
         let mut nodes = BTreeMap::new();
+        let mut stale_indices_acc: Vec<(H256, H256)> = Vec::new();
         for (field_key, obj_change) in &mut state_change_set.changes {
             self.apply_object_change(
                 &resolver,
@@ -123,63 +169,132 @@ impl StateDBStore {
             )?;
         }
 
+        // Only statistics object value bytes to avoid performance loss caused by serialization
+        let size = update_set
+            .iter()
+            .map(|(_k, v)| {
+                let k_len = AccountAddress::LENGTH;
+                let v_len = v.clone().map(|state| state.value.len()).unwrap_or(0);
+                k_len + v_len
+            })
+            .sum::<usize>();
         let mut tree_change_set = self.update_fields(pre_state_root, update_set)?;
         let new_state_root = tree_change_set.state_root;
         nodes.append(&mut tree_change_set.nodes);
-        if log::log_enabled!(log::Level::Debug) {
-            log::debug!(
+        stale_indices_acc.extend(tree_change_set.stale_indices);
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
                 "apply_change_set new_state_root: {:?}, smt nodes: {}, new_global_size: {}",
                 new_state_root,
                 nodes.len(),
                 global_size
             );
         }
-        self.node_store.write_nodes(nodes)?;
         state_change_set.update_state_root(new_state_root);
+
+        self.metrics
+            .state_change_set_to_nodes_bytes
+            .with_label_values(&[fn_name])
+            .observe(size as f64);
+
+        Ok((nodes, stale_indices_acc))
+    }
+
+    pub fn apply_change_set(&self, state_change_set: &mut StateChangeSet) -> Result<()> {
+        let (nodes, _stale_indices) = self.change_set_to_nodes(state_change_set)?;
+        self.node_store.write_nodes(nodes)?;
         Ok(())
     }
 
+    #[named]
     pub fn iter(
         &self,
         state_root: H256,
         starting_key: Option<FieldKey>,
     ) -> Result<SMTIterator<FieldKey, ObjectState, NodeDBStore>> {
+        let fn_name = function_name!();
+        let _timer = self
+            .metrics
+            .state_iter_latency_seconds
+            .with_label_values(&[fn_name])
+            .start_timer();
         self.smt.iter(state_root, starting_key)
     }
 }
 
 impl StatelessResolver for StateDBStore {
-    fn get_field_at(
-        &self,
-        state_root: H256,
-        key: &FieldKey,
-    ) -> std::result::Result<Option<ObjectState>, Error> {
+    #[named]
+    fn get_field_at(&self, state_root: H256, key: &FieldKey) -> Result<Option<ObjectState>, Error> {
+        let fn_name = function_name!();
+        let _timer = self
+            .metrics
+            .state_get_field_at_latency_seconds
+            .with_label_values(&[fn_name])
+            .start_timer();
+
         if state_root == *GENESIS_STATE_ROOT {
             return Ok(None);
         }
-        let result = self.smt.get(state_root, *key);
-        if log::log_enabled!(log::Level::Trace) {
+
+        let result = if let Some(state) = self.cache.get(&(state_root, *key)) {
+            state
+        } else {
+            let state = self.smt.get(state_root, *key)?;
+            self.cache.insert((state_root, *key), state.clone());
+            state
+        };
+        if tracing::enabled!(tracing::Level::TRACE) {
             let result_info = match &result {
-                Ok(Some(state)) => format!("Some({})", state.metadata.object_type),
-                Ok(None) => "None".to_string(),
-                Err(e) => format!("Error({:?})", e),
+                Some(state) => format!("Some({})", state.metadata.object_type),
+                None => "None".to_string(),
             };
-            log::trace!(
+            tracing::trace!(
                 "get_field_at state_root: {} key: {}, result: {:?}",
                 state_root,
                 key,
                 result_info
             );
         }
-        result
+        // Only statistics object value bytes to avoid performance loss caused by serialization
+        let size = result.clone().map(|v| v.value.len()).unwrap_or(0);
+        self.metrics
+            .state_get_field_at_bytes
+            .with_label_values(&[fn_name])
+            .observe(size as f64);
+        Ok(result)
     }
 
+    #[named]
     fn list_fields_at(
         &self,
         state_root: H256,
         cursor: Option<FieldKey>,
         limit: usize,
     ) -> Result<Vec<StateKV>> {
-        self.smt.list(state_root, cursor, limit)
+        let fn_name = function_name!();
+        let _timer = self
+            .metrics
+            .state_list_fields_at_latency_seconds
+            .with_label_values(&[fn_name])
+            .start_timer();
+        let result = self.smt.list(state_root, cursor, limit)?;
+        for (key, state) in &result {
+            self.cache.insert((state_root, *key), Some(state.clone()));
+        }
+
+        // Only statistics object value bytes to avoid performance loss caused by serialization
+        let size = result
+            .iter()
+            .map(|(_k, v)| {
+                let k_len = AccountAddress::LENGTH;
+                let v_len = v.value.len();
+                k_len + v_len
+            })
+            .sum::<usize>();
+        self.metrics
+            .state_list_fields_at_bytes
+            .with_label_values(&[fn_name])
+            .observe(size as f64);
+        Ok(result)
     }
 }

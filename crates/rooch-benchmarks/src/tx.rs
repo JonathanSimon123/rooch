@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::config::TxType;
-use crate::tx::TxType::{Empty, Transfer};
+use crate::tx::TxType::{Empty, Transfer, TransferLargeObject};
 use anyhow::Result;
 use bitcoin::consensus::deserialize;
 use bitcoin::hashes::Hash;
@@ -10,11 +10,13 @@ use bitcoin::hex::FromHex;
 use bitcoincore_rpc::RpcApi;
 use bitcoincore_rpc_json::bitcoin;
 use bitcoincore_rpc_json::bitcoin::Block;
+use prometheus::Registry;
 use rooch_sequencer::actor::sequencer::SequencerActor;
 use rooch_store::RoochStore;
 use rooch_test_transaction_builder::TestTransactionBuilder;
 use rooch_types::crypto::RoochKeyPair;
 use rooch_types::multichain_id::RoochMultiChainID;
+use rooch_types::service_status::ServiceStatus;
 use rooch_types::transaction::rooch::RoochTransaction;
 use rooch_types::transaction::L1BlockWithBody;
 use std::fs;
@@ -24,8 +26,18 @@ use tracing::info;
 pub const EXAMPLE_SIMPLE_BLOG_PACKAGE_NAME: &str = "simple_blog";
 pub const EXAMPLE_SIMPLE_BLOG_NAMED_ADDRESS: &str = "simple_blog";
 
-pub fn gen_sequencer(keypair: RoochKeyPair, rooch_store: RoochStore) -> Result<SequencerActor> {
-    SequencerActor::new(keypair, rooch_store.clone())
+pub fn gen_sequencer(
+    keypair: RoochKeyPair,
+    rooch_store: RoochStore,
+    registry: &Registry,
+) -> Result<SequencerActor> {
+    SequencerActor::new(
+        keypair,
+        rooch_store.clone(),
+        ServiceStatus::Active,
+        registry,
+        None,
+    )
 }
 
 pub fn create_publish_transaction(
@@ -48,6 +60,7 @@ pub fn create_l2_tx(
     let action = match tx_type {
         Empty => test_transaction_builder.call_empty_create(),
         Transfer => test_transaction_builder.call_transfer_create(),
+        TransferLargeObject => test_transaction_builder.call_transfer_large_object_create(),
         _ => panic!("Unsupported tx type"),
     };
 
@@ -74,9 +87,9 @@ pub fn find_block_height(dir: &Path) -> Result<Vec<u64>> {
 }
 
 pub fn create_btc_blk_tx(height: u64, block_file: &Path) -> Result<L1BlockWithBody> {
-    let block_hex_str = fs::read_to_string(block_file).unwrap();
-    let block_hex = Vec::<u8>::from_hex(&block_hex_str).unwrap();
-    let origin_block: Block = deserialize(&block_hex).unwrap();
+    let block_hex_str = fs::read_to_string(block_file)?;
+    let block_hex = Vec::<u8>::from_hex(&block_hex_str)?;
+    let origin_block: Block = deserialize(&block_hex)?;
     let block = origin_block.clone();
     let block_hash = block.header.block_hash();
     let move_block = rooch_types::bitcoin::types::Block::from(block.clone());

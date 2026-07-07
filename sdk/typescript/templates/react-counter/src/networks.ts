@@ -5,6 +5,12 @@ import { DEVNET_COUNTER_PACKAGE_ID, MAINNET_COUNTER_PACKAGE_ID } from './constan
 
 const { networkConfig, useNetworkVariable, useNetworkVariables } =
   createNetworkConfig({
+    mainnet: {
+      url: getRoochNodeUrl("mainnet"),
+      variables: {
+        counterPackageId: DEVNET_COUNTER_PACKAGE_ID,
+      },
+    },
     devnet: {
       url: getRoochNodeUrl("devnet"),
       variables: {
@@ -20,7 +26,7 @@ const { networkConfig, useNetworkVariable, useNetworkVariables } =
     localnet: {
       url: getRoochNodeUrl("localnet"),
       variables: {
-        counterPackageId: MAINNET_COUNTER_PACKAGE_ID,
+        counterPackageId: DEVNET_COUNTER_PACKAGE_ID,
       },
     },
   })

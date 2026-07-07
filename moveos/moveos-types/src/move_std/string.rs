@@ -27,6 +27,20 @@ impl MoveString {
     }
 }
 
+impl MoveString {
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes).expect("MoveString is not utf8")
+    }
+}
+
 impl std::fmt::Debug for MoveString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self)
@@ -35,11 +49,14 @@ impl std::fmt::Debug for MoveString {
 
 impl std::fmt::Display for MoveString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            std::str::from_utf8(&self.bytes).map_err(|_| std::fmt::Error)?
-        )
+        match std::str::from_utf8(&self.bytes) {
+            Ok(s) => {
+                write!(f, "{}", s)
+            }
+            Err(_) => {
+                write!(f, "{:?}", &self.bytes)
+            }
+        }
     }
 }
 
@@ -124,17 +141,26 @@ impl TryFrom<AnnotatedMoveStruct> for MoveString {
     type Error = anyhow::Error;
 
     fn try_from(value: AnnotatedMoveStruct) -> Result<Self, Self::Error> {
-        let mut annotated_move_struct = value;
+        MoveString::try_from(&value)
+    }
+}
+
+impl TryFrom<&AnnotatedMoveStruct> for MoveString {
+    type Error = anyhow::Error;
+
+    fn try_from(annotated_move_struct: &AnnotatedMoveStruct) -> Result<Self, Self::Error> {
         let (field_name, field_value) = annotated_move_struct
             .value
-            .pop()
+            .first()
             .ok_or_else(|| anyhow::anyhow!("Invalid MoveString"))?;
         debug_assert!(field_name.as_str() == "bytes");
         let bytes = match field_value {
             AnnotatedMoveValue::Bytes(bytes) => bytes,
             _ => return Err(anyhow::anyhow!("Invalid MoveString")),
         };
-        Ok(MoveString { bytes })
+        Ok(MoveString {
+            bytes: bytes.clone(),
+        })
     }
 }
 

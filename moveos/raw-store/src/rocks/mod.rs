@@ -10,7 +10,7 @@ use std::iter;
 use std::marker::PhantomData;
 use std::path::Path;
 
-use anyhow::{ensure, format_err, Error, Result};
+use anyhow::{ensure, Error, Result};
 use rocksdb::{
     statistics, AsColumnFamilyRef, BlockBasedIndexType, BlockBasedOptions, CStrLike, Cache,
     ColumnFamily, ColumnFamilyDescriptor, DBCompressionType, DBRawIterator, DBRecoveryMode,
@@ -22,8 +22,7 @@ use serde::Serialize;
 use moveos_common::utils::{check_open_fds_limit, from_bytes};
 use moveos_config::store_config::RocksdbConfig;
 
-use crate::errors::RawStoreError;
-use crate::rocks::batch::WriteBatch;
+use crate::rocks::batch::{WriteBatch, WriteBatchCF};
 use crate::traits::DBStore;
 use crate::{ColumnFamilyName, WriteOp};
 
@@ -31,11 +30,14 @@ pub mod batch;
 
 pub const DEFAULT_COLUMN_FAMILY_NAME: ColumnFamilyName = "default";
 pub const RES_FDS: u64 = 4096;
+const DEFAULT_ESTIMATED_ENTRY_CHARGE_SIZE: usize = 4200;
 
 #[allow(clippy::upper_case_acronyms)]
 pub struct RocksDB {
     db: DB,
+    table_opts: BlockBasedOptions,
     pub(crate) cfs: Vec<ColumnFamilyName>,
+    rocksdb_config: RocksdbConfig,
 }
 
 impl RocksDB {
@@ -47,6 +49,14 @@ impl RocksDB {
         Self::open_with_cfs(db_path, column_families, false, rocksdb_config)
     }
 
+    pub fn new_readonly<P: AsRef<Path> + Clone>(
+        db_path: P,
+        column_families: Vec<ColumnFamilyName>,
+        rocksdb_config: RocksdbConfig,
+    ) -> Result<Self> {
+        Self::open_with_cfs(db_path, column_families, true, rocksdb_config)
+    }
+
     pub fn open_with_cfs(
         root_path: impl AsRef<Path>,
         column_families: Vec<ColumnFamilyName>,
@@ -56,68 +66,73 @@ impl RocksDB {
         let path = root_path.as_ref();
 
         let cfs_set: HashSet<_> = column_families.iter().collect();
-        {
-            ensure!(
-                cfs_set.len() == column_families.len(),
-                "Duplicate column family name found.",
-            );
-        }
+        ensure!(
+            cfs_set.len() == column_families.len(),
+            "Duplicate column family name found.",
+        );
+
         #[allow(clippy::unnecessary_to_owned)]
-        if Self::db_exists(path) {
+        let final_column_families: Vec<ColumnFamilyName> = if Self::db_exists(path) {
             let cf_vec = Self::list_cf(path)?;
-            let mut db_cfs_set: HashSet<_> = cf_vec.iter().collect();
-            db_cfs_set.remove(&DEFAULT_COLUMN_FAMILY_NAME.to_string());
-            ensure!(
-                db_cfs_set.len() <= cfs_set.len(),
-                RawStoreError::StoreCheckError(format_err!(
-                    "ColumnFamily in db ({:?}) not same as ColumnFamily in code {:?}.",
-                    column_families,
-                    cf_vec
-                ))
-            );
-            let mut remove_cf_vec = Vec::new();
-            db_cfs_set.iter().for_each(|k| {
-                if !cfs_set.contains(&k.as_str()) {
-                    remove_cf_vec.push(<&String>::clone(k));
+            let mut db_cfs_set: HashSet<String> = cf_vec.into_iter().collect();
+            db_cfs_set.remove(DEFAULT_COLUMN_FAMILY_NAME);
+
+            // Merge DB CFs with code CFs to support version rollback:
+            // - DB may have newer CFs (from newer version) that code doesn't know about
+            // - Code may have newer CFs (from newer version) that DB doesn't have yet
+            // - We open with the union of both sets to satisfy RocksDB's requirement
+            //   that all existing CFs must be opened
+            let code_cfs_set: HashSet<String> =
+                column_families.iter().map(|s| s.to_string()).collect();
+
+            // Convert back to Vec<&'static str>
+            let mut result: Vec<ColumnFamilyName> = Vec::new();
+            for cf in &column_families {
+                result.push(*cf);
+            }
+            // Add any DB CFs that are not in code
+            for db_cf in &db_cfs_set {
+                if !code_cfs_set.contains(db_cf) {
+                    // For CFs that exist in DB but not in code, we need to leak the string
+                    // to get a 'static lifetime. This is acceptable because:
+                    // 1. The number of CFs is small
+                    // 2. This only happens during version rollback scenarios
+                    let leaked: &'static str = Box::leak(db_cf.clone().into_boxed_str());
+                    result.push(leaked);
                 }
-            });
-            ensure!(
-                remove_cf_vec.is_empty(),
-                RawStoreError::StoreCheckError(format_err!(
-                    "Can not remove ColumnFamily, ColumnFamily in db ({:?}) not in code {:?}.",
-                    remove_cf_vec,
-                    cf_vec
-                ))
-            );
-        }
+            }
+            result
+        } else {
+            column_families.clone()
+        };
 
         let mut rocksdb_opts = Self::gen_rocksdb_options(&rocksdb_config);
 
+        let table_opts = Self::generate_table_opts(&rocksdb_config);
         let db = if readonly {
-            Self::open_readonly(&rocksdb_opts, path, column_families.clone())?
+            rocksdb_opts.set_error_if_exists(false);
+            Self::open_readonly_inner_db(&rocksdb_opts, path, final_column_families.clone())?
         } else {
             rocksdb_opts.create_if_missing(true);
             rocksdb_opts.create_missing_column_families(true);
-            Self::open_inner(
-                &rocksdb_config,
+            Self::open_inner_db(
+                &table_opts,
                 &rocksdb_opts,
                 path,
-                column_families.clone(),
+                final_column_families.clone(),
+                &rocksdb_config,
             )?
         };
         check_open_fds_limit(rocksdb_config.max_open_files as u64 + RES_FDS)?;
         Ok(RocksDB {
             db,
-            cfs: column_families,
+            table_opts,
+            cfs: final_column_families,
+            rocksdb_config,
         })
     }
 
-    fn open_inner(
-        rocksdb_config: &RocksdbConfig,
-        opts: &Options,
-        path: impl AsRef<Path>,
-        column_families: Vec<ColumnFamilyName>,
-    ) -> Result<DB> {
+    pub fn generate_table_opts(rocksdb_config: &RocksdbConfig) -> BlockBasedOptions {
         let mut table_opts = BlockBasedOptions::default();
 
         // options for enabling partitioned index filter
@@ -129,49 +144,72 @@ impl RocksDB {
         table_opts.set_pin_top_level_index_and_filter(true);
         table_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
 
-        let cache = Cache::new_lru_cache(rocksdb_config.block_cache_size as usize);
+        let cache = Cache::new_hyper_clock_cache(
+            rocksdb_config.block_cache_size as usize,
+            DEFAULT_ESTIMATED_ENTRY_CHARGE_SIZE,
+        );
         table_opts.set_block_cache(&cache);
+        table_opts
+    }
 
+    fn open_inner_db(
+        table_opts: &BlockBasedOptions,
+        opts: &Options,
+        path: impl AsRef<Path>,
+        column_families: Vec<ColumnFamilyName>,
+        rocksdb_config: &RocksdbConfig,
+    ) -> Result<DB> {
         let inner = DB::open_cf_descriptors(
             opts,
             path,
             column_families.iter().map(|cf_name| {
-                let mut cf_opts = Options::default();
-                cf_opts.set_level_compaction_dynamic_level_bytes(true);
-                cf_opts.set_compression_per_level(&[
-                    DBCompressionType::None,
-                    DBCompressionType::None,
-                    DBCompressionType::Lz4,
-                    DBCompressionType::Lz4,
-                    DBCompressionType::Lz4,
-                    DBCompressionType::Lz4,
-                    DBCompressionType::Lz4,
-                ]);
-                cf_opts.set_block_based_table_factory(&table_opts);
-
-                cf_opts.set_enable_blob_files(true);
-                cf_opts.set_min_blob_size(1024);
-                cf_opts.set_enable_blob_gc(false);
-                cf_opts.set_blob_compression_type(DBCompressionType::Lz4);
-
-                if (*cf_name) == "state_node" {
-                    cf_opts.set_write_buffer_size(512 * 1024 * 1024);
-                    cf_opts.set_max_write_buffer_number(4);
-
-                    cf_opts.set_target_file_size_base(128 * 1024 * 1024);
-                    cf_opts.set_max_bytes_for_level_base(2 * 1024 * 1024 * 1024);
-                    cf_opts.set_level_compaction_dynamic_level_bytes(false);
-                    cf_opts.set_max_bytes_for_level_multiplier(8f64);
-                    cf_opts.set_compaction_readahead_size(2 * 1024 * 1024);
-                }
-
+                let cf_opts = Self::generate_cf_options(cf_name, table_opts, rocksdb_config);
                 ColumnFamilyDescriptor::new((*cf_name).to_string(), cf_opts)
             }),
         )?;
         Ok(inner)
     }
 
-    fn open_readonly(
+    pub fn generate_cf_options(
+        cf_name: &str,
+        table_opts: &BlockBasedOptions,
+        rocksdb_config: &RocksdbConfig,
+    ) -> Options {
+        let mut cf_opts = Options::default();
+        cf_opts.set_level_compaction_dynamic_level_bytes(true);
+        cf_opts.set_compression_per_level(&[
+            DBCompressionType::None,
+            DBCompressionType::None,
+            DBCompressionType::Lz4,
+            DBCompressionType::Lz4,
+            DBCompressionType::Lz4,
+            DBCompressionType::Lz4,
+            DBCompressionType::Lz4,
+        ]);
+        cf_opts.set_block_based_table_factory(table_opts);
+
+        cf_opts.set_enable_blob_files(true);
+        cf_opts.set_min_blob_size(1024);
+        // Enable BlobDB garbage collection to reclaim space of obsolete blob records
+        cf_opts.set_enable_blob_gc(true);
+        cf_opts.set_blob_compression_type(DBCompressionType::Lz4);
+        cf_opts.set_disable_auto_compactions(rocksdb_config.disable_auto_compactions);
+
+        if cf_name == "state_node" {
+            cf_opts.set_write_buffer_size(512 * 1024 * 1024);
+            cf_opts.set_max_write_buffer_number(4);
+
+            cf_opts.set_target_file_size_base(128 * 1024 * 1024);
+            cf_opts.set_max_bytes_for_level_base(2 * 1024 * 1024 * 1024);
+            cf_opts.set_level_compaction_dynamic_level_bytes(false);
+            cf_opts.set_max_bytes_for_level_multiplier(8f64);
+            cf_opts
+                .set_compaction_readahead_size(rocksdb_config.compaction_readahead_size as usize);
+        }
+        cf_opts
+    }
+
+    fn open_readonly_inner_db(
         db_opts: &Options,
         path: impl AsRef<Path>,
         column_families: Vec<ColumnFamilyName>,
@@ -182,24 +220,26 @@ impl RocksDB {
         Ok(inner)
     }
 
-    pub fn drop_cf(&mut self) -> Result<(), Error> {
+    pub fn drop_all_cfs(&mut self) -> Result<(), Error> {
         for cf in self.cfs.clone() {
             self.db.drop_cf(cf)?;
         }
         Ok(())
     }
 
-    pub fn drop_unused_cfs(&mut self, names: Vec<&str>) -> Result<(), Error> {
-        // https://github.com/facebook/rocksdb/issues/1295
+    pub fn drop_cf(&mut self, name: &str) -> Result<(), Error> {
+        self.db.drop_cf(name)?;
+        self.db.flush()?;
+        Ok(())
+    }
+
+    // clear all data in column families
+    pub fn clear_cfs(&mut self, names: Vec<&str>) -> Result<(), Error> {
+        // Best way to delete everything from column family: https://github.com/facebook/rocksdb/issues/1295
         for name in names {
-            for cf in &self.cfs {
-                if cf == &name {
-                    self.db.drop_cf(name)?;
-                    let opt = Options::default();
-                    self.db.create_cf(name, &opt)?;
-                    break;
-                }
-            }
+            self.db.drop_cf(name)?;
+            let opt = Self::generate_cf_options(name, &self.table_opts, &self.rocksdb_config);
+            self.db.create_cf(name, &opt)?;
         }
         Ok(())
     }
@@ -217,6 +257,17 @@ impl RocksDB {
     /// List cf
     pub fn list_cf(path: impl AsRef<Path>) -> Result<Vec<String>, Error> {
         Ok(DB::list_cf(&Options::default(), path)?)
+    }
+
+    /// Expose underlying rocksdb::DB, used for advanced operations such as WAL-free batch writes.
+    pub fn inner(&self) -> &rocksdb::DB {
+        &self.db
+    }
+
+    /// Flush write-ahead log. Exposed for pruning tasks to truncate large WAL after massive deletes.
+    pub fn flush_wal(&self, sync: bool) -> Result<()> {
+        self.db.flush_wal(sync)?;
+        Ok(())
     }
 
     fn db_exists(path: &Path) -> bool {
@@ -239,7 +290,7 @@ impl RocksDB {
         opts
     }
 
-    fn gen_rocksdb_options(config: &RocksdbConfig) -> Options {
+    pub fn gen_rocksdb_options(config: &RocksdbConfig) -> Options {
         let mut db_opts = Options::default();
         db_opts.set_max_open_files(config.max_open_files);
         db_opts.set_max_total_wal_size(config.max_total_wal_size);
@@ -247,12 +298,15 @@ impl RocksDB {
         db_opts.set_bytes_per_sync(config.bytes_per_sync);
         db_opts.set_max_background_jobs(config.max_background_jobs as c_int);
         db_opts.set_max_write_buffer_number(config.max_write_buffer_numer as c_int);
-        let cache = Cache::new_lru_cache(config.row_cache_size as usize);
-        db_opts.set_row_cache(&cache);
         db_opts.set_enable_pipelined_write(true);
         db_opts.set_wal_recovery_mode(DBRecoveryMode::PointInTime); // for memtable crash recovery
-        db_opts.enable_statistics();
-        db_opts.set_statistics_level(statistics::StatsLevel::ExceptTimeForMutex);
+        db_opts.set_allow_mmap_reads(config.allow_mmap_reads);
+        db_opts.set_advise_random_on_open(config.advise_random_on_open);
+        if config.enable_statistics {
+            db_opts.enable_statistics();
+            db_opts.set_statistics_level(statistics::StatsLevel::ExceptTimeForMutex);
+        }
+
         db_opts
     }
     fn iter_with_direction<K, V>(
@@ -293,6 +347,26 @@ impl RocksDB {
     fn sync_write_options() -> WriteOptions {
         let mut opts = WriteOptions::new();
         opts.set_sync(true);
+        opts
+    }
+
+    fn non_sync_write_options() -> WriteOptions {
+        let mut opts = WriteOptions::new();
+        opts.set_sync(false);
+        opts
+    }
+
+    fn write_options(sync: bool) -> WriteOptions {
+        if sync {
+            Self::sync_write_options()
+        } else {
+            Self::non_sync_write_options()
+        }
+    }
+
+    fn get_no_cache_options() -> ReadOptions {
+        let mut opts = ReadOptions::default();
+        opts.fill_cache(false);
         opts
     }
 
@@ -406,6 +480,13 @@ impl DBStore for RocksDB {
             _ => Ok(false),
         }
     }
+
+    fn may_contains_key(&self, cf_name: &str, key: &[u8]) -> Result<bool> {
+        let cf_handle = self.get_cf_handle(cf_name);
+        let may_exist = self.db.key_may_exist_cf(&cf_handle, key);
+        Ok(may_exist)
+    }
+
     fn remove(&self, cf_name: &str, key: Vec<u8>) -> Result<()> {
         let cf_handle = self.get_cf_handle(cf_name);
         self.db.delete_cf(&cf_handle, key)?;
@@ -466,12 +547,51 @@ impl DBStore for RocksDB {
             .map(|(key, handle)| (handle, key.as_slice()))
             .collect::<Vec<_>>();
 
-        let result = self.db.multi_get_cf(keys_multi);
+        let result = self
+            .db
+            .multi_get_cf_opt(keys_multi, &Self::get_no_cache_options());
         let mut res = vec![];
         for item in result {
             let item = item?;
             res.push(item);
         }
         Ok(res)
+    }
+
+    fn write_batch_across_cfs(
+        &self,
+        cf_names: Vec<&str>,
+        batch: WriteBatch,
+        sync: bool,
+    ) -> Result<()> {
+        assert_eq!(cf_names.len(), batch.rows.len());
+        let mut db_batch = DBWriteBatch::default();
+        for (idx, (key, write_op)) in batch.rows.iter().enumerate() {
+            let cf_name = *cf_names.get(idx).unwrap();
+            let cf_handle = self.get_cf_handle(cf_name);
+            match write_op {
+                WriteOp::Value(value) => db_batch.put_cf(&cf_handle, key, value),
+                WriteOp::Deletion => db_batch.delete_cf(&cf_handle, key),
+            };
+        }
+
+        self.db.write_opt(db_batch, &Self::write_options(sync))?;
+        Ok(())
+    }
+
+    fn write_cf_batch(&self, cf_batches: Vec<WriteBatchCF>, sync: bool) -> Result<()> {
+        let mut db_batch = DBWriteBatch::default();
+        for batch_cf in cf_batches {
+            let cf_handle = self.get_cf_handle(batch_cf.cf_name.as_str());
+            for (key, write_op) in batch_cf.batch.rows {
+                match write_op {
+                    WriteOp::Value(value) => db_batch.put_cf(&cf_handle, key, value),
+                    WriteOp::Deletion => db_batch.delete_cf(&cf_handle, key),
+                };
+            }
+        }
+
+        self.db.write_opt(db_batch, &Self::write_options(sync))?;
+        Ok(())
     }
 }

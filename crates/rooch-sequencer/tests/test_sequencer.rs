@@ -3,19 +3,34 @@
 
 use anyhow::Result;
 use coerce::actor::{system::ActorSystem, IntoActor};
+use metrics::RegistryService;
+use prometheus::Registry;
+use raw_store::metrics::DBMetrics;
+use raw_store::StoreInstance;
 use rooch_config::RoochOpt;
 use rooch_db::RoochDB;
-use rooch_genesis::RoochGenesis;
+use rooch_genesis::RoochGenesisV2;
 use rooch_sequencer::{actor::sequencer::SequencerActor, proxy::SequencerProxy};
 use rooch_types::{
     crypto::RoochKeyPair,
+    service_status::ServiceStatus,
     transaction::{LedgerTxData, RoochTransaction},
 };
 
-fn init_rooch_db(opt: &RoochOpt) -> Result<RoochDB> {
-    let rooch_db = RoochDB::init(opt.store_config())?;
+fn init_rooch_db(opt: &RoochOpt, registry: &Registry) -> Result<RoochDB> {
+    DBMetrics::init(registry);
+    let store_instance = RoochDB::generate_store_instance(opt.store_config(), registry, false)?;
+    init_rooch_db_with_instance(opt, store_instance, registry)
+}
+
+fn init_rooch_db_with_instance(
+    opt: &RoochOpt,
+    instance: StoreInstance,
+    registry: &Registry,
+) -> Result<RoochDB> {
+    let rooch_db = RoochDB::init_with_instance(opt.store_config(), instance, registry)?;
     let network = opt.network();
-    let _genesis = RoochGenesis::load_or_init(network, &rooch_db)?;
+    let _genesis = RoochGenesisV2::load_or_init(network, &rooch_db)?;
     Ok(rooch_db)
 }
 
@@ -23,10 +38,26 @@ fn init_rooch_db(opt: &RoochOpt) -> Result<RoochDB> {
 async fn test_sequencer() -> Result<()> {
     let opt = RoochOpt::new_with_temp_store()?;
     let mut last_tx_order = 0;
+    let registry_service = RegistryService::default();
     {
-        let rooch_db = init_rooch_db(&opt)?;
+        let store_instance = RoochDB::generate_store_instance(
+            opt.store_config(),
+            &registry_service.default_registry(),
+            false,
+        )?;
+        let rooch_db = init_rooch_db_with_instance(
+            &opt,
+            store_instance.clone(),
+            &registry_service.default_registry(),
+        )?;
         let sequencer_key = RoochKeyPair::generate_secp256k1();
-        let mut sequencer = SequencerActor::new(sequencer_key, rooch_db.rooch_store)?;
+        let mut sequencer = SequencerActor::new(
+            sequencer_key,
+            rooch_db.rooch_store,
+            ServiceStatus::Active,
+            &registry_service.default_registry(),
+            None,
+        )?;
         assert_eq!(sequencer.last_order(), last_tx_order);
         for _ in 0..10 {
             let tx_data = LedgerTxData::L2Tx(RoochTransaction::mock());
@@ -38,9 +69,17 @@ async fn test_sequencer() -> Result<()> {
     }
     // load from db again
     {
-        let rooch_db = RoochDB::init(opt.store_config())?;
+        // To avoid AlreadyReg for re init the same db
+        let new_registry = prometheus::Registry::new();
+        let rooch_db = RoochDB::init(opt.store_config(), &new_registry)?;
         let sequencer_key = RoochKeyPair::generate_secp256k1();
-        let mut sequencer = SequencerActor::new(sequencer_key, rooch_db.rooch_store)?;
+        let mut sequencer = SequencerActor::new(
+            sequencer_key,
+            rooch_db.rooch_store,
+            ServiceStatus::Active,
+            &new_registry,
+            None,
+        )?;
         assert_eq!(sequencer.last_order(), last_tx_order);
         let tx_data = LedgerTxData::L2Tx(RoochTransaction::mock());
         let ledger_tx = sequencer.sequence(tx_data)?;
@@ -51,17 +90,24 @@ async fn test_sequencer() -> Result<()> {
 
 // test concurrent
 // Build a sequencer actor and sequence transactions concurrently
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 5)]
 async fn test_sequencer_concurrent() -> Result<()> {
     let opt = RoochOpt::new_with_temp_store()?;
-    let rooch_db = init_rooch_db(&opt)?;
+    let registry_service = RegistryService::default();
+    let rooch_db = init_rooch_db(&opt, &registry_service.default_registry())?;
     let sequencer_key = RoochKeyPair::generate_secp256k1();
 
     let actor_system = ActorSystem::global_system();
 
-    let sequencer = SequencerActor::new(sequencer_key, rooch_db.rooch_store)?
-        .into_actor(Some("Sequencer"), &actor_system)
-        .await?;
+    let sequencer = SequencerActor::new(
+        sequencer_key,
+        rooch_db.rooch_store,
+        ServiceStatus::Active,
+        &registry_service.default_registry(),
+        None,
+    )?
+    .into_actor(Some("Sequencer"), &actor_system)
+    .await?;
     let sequencer_proxy = SequencerProxy::new(sequencer.into());
 
     // start n thread to sequence

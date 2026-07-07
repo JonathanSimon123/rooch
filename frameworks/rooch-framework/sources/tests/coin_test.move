@@ -4,6 +4,7 @@
 #[test_only]
 /// This test module is used to test the coin logic in coin and account module.
 module rooch_framework::coin_test{
+    use std::option;
     use std::string;
     
     use moveos_std::object::{Self, Object};
@@ -24,6 +25,7 @@ module rooch_framework::coin_test{
         coin::register_extend<FakeCoin>(
             string::utf8(b"Fake coin"),
             string::utf8(b"FCD"),
+            option::none(),
             decimals,
         )
     }
@@ -38,9 +40,9 @@ module rooch_framework::coin_test{
         let decimals = 9u8;
 
         let coin_info_obj = register_extend<FakeCoin>(
-            
             name,
             symbol,
+            option::none(),
             decimals,
         );
         {
@@ -50,6 +52,12 @@ module rooch_framework::coin_test{
             assert!(symbol<FakeCoin>(coin_info) == symbol, 2);
             assert!(decimals<FakeCoin>(coin_info) == decimals, 3);
         };
+        //coin info by type
+        assert!(coin::supply_by_type<FakeCoin>() == 0, 4);
+        assert!(coin::name_by_type<FakeCoin>() == name, 5);
+        assert!(coin::symbol_by_type<FakeCoin>() == symbol, 6);
+        assert!(coin::decimals_by_type<FakeCoin>() == decimals, 7);
+        assert!(coin::icon_url_by_type<FakeCoin>() == option::none(), 8);
 
         let coins_minted = mint_extend<FakeCoin>(&mut coin_info_obj, 100);
         
@@ -78,17 +86,17 @@ module rooch_framework::coin_test{
         rooch_framework::genesis::init_for_test();
 
         let coin_info_obj = register_extend<FakeCoin>(
-            
             string::utf8(b"Fake coin"),
             string::utf8(b"FCD"),
+            option::none(),
             9,
         );
         object::transfer(coin_info_obj, @rooch_framework);
 
         let coin_info_obj = register_extend<FakeCoin>(
-            
             string::utf8(b"Fake coin"),
             string::utf8(b"FCD"),
+            option::none(),
             9,
         );
         object::transfer(coin_info_obj, @rooch_framework);

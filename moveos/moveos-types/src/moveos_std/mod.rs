@@ -6,6 +6,7 @@
 pub mod account;
 pub mod any;
 pub mod copyable_any;
+pub mod decimal_value;
 pub mod display;
 pub mod event;
 pub mod gas_schedule;
@@ -14,6 +15,7 @@ pub mod module_store;
 pub mod module_upgrade_flag;
 pub mod move_module;
 pub mod object;
+pub mod onchain_features;
 pub mod simple_map;
 pub mod simple_multimap;
 pub mod table;

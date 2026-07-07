@@ -1,121 +1,44 @@
 ## Rooch Statedb tool
 
-A tool to export and import rooch statedb.
+A tool to export/import rooch statedb.
 
 ### Usage
 
-#### Prerequisite for genesis-* command
+#### genesis
 
-1. bitcoind synced with `-txindex=1` and `-server=1` option:
+##### overview
 
-```shell
-bitcoind -datadir=<datadir> -txindex=1 -server=1
-```
+`genesis` is a subcommand to generate rooch statedb from utxo and ord source files. Run it before starting rooch node.
 
-2. set block height to genesis block height:
+Source data needed by `genesis` for Rooch MainNet could be
+found [here](https://storage.googleapis.com/rooch_dev/genesis-source/README.md).
 
-expect height: `<h>`
+For protecting the data integrity, verify checksum file's sha256 before running `genesis` command.
 
-get `<h+1>` block hash:
+checksum file's sha256:
 
-```shell
-bitcoin-cli -datadir=<datadir> -conf=<datadir/bitcoin.conf> -rpccookiefile=<datadir/.cookie> getblockhash <h+1>
-<h+1 block hash>
-```
+`cbd0c0a9f4c0f308c29b83dc50b4b4f2684f7eb17df0d66446f8b1f86589dce5`
 
-invalid `<h+1>` block:
+calculated by:
 
 ```shell
-bitcoin-cli -datadir=<datadir> -conf=<datadir/bitcoin.conf> -rpccookiefile=<datadir/.cookie> invalidateblock <h+1 block hash>
+sha256sum checksum
 ```
 
-check block height:
+result:
 
 ```shell
-bitcoin-cli -datadir=<datadir> -conf=<datadir/bitcoin.conf> -rpccookiefile=<datadir/.cookie> getblockcount
-<h>
+sha256sum checksum
+cbd0c0a9f4c0f308c29b83dc50b4b4f2684f7eb17df0d66446f8b1f86589dce5  checksum
 ```
 
-3. prepare utxo source file:
+##### Steps
 
-> - stop bitcoind first
-> - clone chainstate:
+- extra source files to a directory, e.g. `./source`
+- set `<{utxo/ord}-batch-size>` in option for gain balance between performance and memory usage
+- create a directory for storing statedb: `<base-data-dir/chain-id>`. e.g. `~/rooch/main`: `~/rooch`
+  as `base-data-dir`; `main` as `chain-id` in option
 
-```shell
-rsync --delete -av <datadir/chainstate/> <chainstate_clone_path>
-```
+#### Other Subcommands
 
-> - dump utxo source file(each line is a utxo record, format
-    is `count,txid,vout,height,coinbase,amount,script,type,address`) by
-    [bitcoin-utxo-dump](https://github.com/in3rsha/bitcoin-utxo-dump):
-
-```shell
-bitcoin-utxo-dump -f count,txid,vout,height,coinbase,amount,script,type,address -db <chainstate_clone_path> -o <output>
-```
-
-> - check max height of dump file is <h> by python script:
-
-```python
-import pandas as pd
-import sys
-
-if len(sys.argv) != 2:
-    print("Usage: python max_height.py filename")
-    sys.exit(1)
-
-filename = sys.argv[1]
-
-df = pd.read_csv(filename)
-
-max_height = df['height'].max()
-
-print(f"The maximum height is: {max_height}")
-```
-
-4. prepare ord source file(if needed):
-
-> - start bitcoind again
-> - dump ord source file by
-    [ord](https://github.com/popcnt1/ord):
-
-```shell
-ord --index=<ord_dump_dir/index.redb> --cookie-file=<bitcoincore_dir/.cookie> index export --output <output>
-```
-
-5. prepare genesis env:
-
-```shell
-rooch genesis init -n main -d <rooch_datadir>
-```
-
-#### Commands
-
-**genesis-utxo**:
-
-```shell
-rooch statedb genesis-utxo --input <utxo_src_path> -d <rooch_datadir> -n main --batch-size <utxo_batch_size>
-```
-
-**genesis-ord**:
-
-```shell
-rooch statedb genesis-ord --utxo-source <utxo_src_path> --ord-source <ord_src_path> -d <rooch_datadir> -n main --utxo-ord-map <db_dir> --utxo-batch-size <utxo_batch_size> --ord-batch-size <ord_batch_size>
-```
-
-***tips***:
-
-> - `--utxo-ord-map` is redb database file path. We could reuse it in `genesis-utxo` command.
-> - `--batch-size`/`--utxo-batch-size` is optional, default is 2M. Set it smaller if memory is limited.
-> - `--ord-batch-size` is optional, default is 1M. Set it smaller if memory is limited.
-
-**rooch statedb export**:
-
-```shell
-rooch statedb export --output {your file} -d {your rooch data dir} -n main -m {export mode}
-```
-
-**rooch statedb import**:
-
-```shell
-rooch statedb import --input {your file} -d {your rooch data dir} -n main
-```
+TODO

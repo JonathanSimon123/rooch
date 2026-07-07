@@ -1,56 +1,53 @@
 // Copyright (c) RoochNetwork
 // SPDX-License-Identifier: Apache-2.0
 
-use rooch_types::address::{BitcoinAddress, EthereumAddress, RoochAddress};
-use serde::{Deserialize, Deserializer, Serialize};
-use std::str::FromStr;
+use rooch_rpc_api::jsonrpc_types::UnitedAddressView;
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum FaucetRequest {
-    FixedRoochAddressRequest(FixedRoochAddressRequest),
-    FixedETHAddressRequest(FixedETHAddressRequest),
-    FixedBTCAddressRequest(FixedBTCAddressRequest),
+pub struct FaucetRequest {
+    pub claimer: UnitedAddressView,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FaucetRequestWithInviter {
+    pub claimer: UnitedAddressView,
+    pub inviter: UnitedAddressView,
+    pub claimer_sign: String,
+    pub public_key: String,
+    pub message: String,
 }
 
 impl FaucetRequest {
-    pub fn recipient(&self) -> &dyn std::fmt::Display {
-        match self {
-            FaucetRequest::FixedRoochAddressRequest(req) => &req.recipient,
-            FaucetRequest::FixedBTCAddressRequest(req) => &req.recipient,
-            FaucetRequest::FixedETHAddressRequest(req) => &req.recipient,
-        }
+    pub fn recipient(&self) -> UnitedAddressView {
+        self.claimer.clone()
+    }
+}
+
+impl FaucetRequestWithInviter {
+    pub fn recipient(&self) -> UnitedAddressView {
+        self.claimer.clone()
+    }
+    pub fn inviter(&self) -> UnitedAddressView {
+        self.inviter.clone()
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct FixedRoochAddressRequest {
-    pub recipient: RoochAddress,
+pub struct FetchTweetRequest {
+    pub tweet_id: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct FixedETHAddressRequest {
-    pub recipient: EthereumAddress,
+pub struct VerifyAndBindingTwitterAccountRequest {
+    pub tweet_id: String,
 }
 
-#[derive(Serialize, Debug, Clone)]
-pub struct FixedBTCAddressRequest {
-    pub recipient: BitcoinAddress,
-}
-
-impl<'de> Deserialize<'de> for FixedBTCAddressRequest {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct TempFixedBTCAddressRequest {
-            recipient: String,
-        }
-
-        let temp = TempFixedBTCAddressRequest::deserialize(deserializer)?;
-        let recipient =
-            BitcoinAddress::from_str(&temp.recipient).map_err(serde::de::Error::custom)?;
-
-        Ok(FixedBTCAddressRequest { recipient })
-    }
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct VerifyAndBindingTwitterAccountWithInviter {
+    pub tweet_id: String,
+    pub inviter: UnitedAddressView,
+    pub claimer_sign: String,
+    pub public_key: String,
+    pub message: String,
 }
